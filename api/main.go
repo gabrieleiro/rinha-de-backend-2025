@@ -1,18 +1,24 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
-	"sync"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 )
 
 const DEFAULT_PAYMENTS_ENDPOINT = "http://127.0.0.1:8001/payments"
 const FALLBACK_PAYMENTS_ENDPOINT = "http://127.0.0.1:8002/payments"
+const PAYMENTS_SUMMARY_ENDPOINT = "http://localhost:1111/summary"
+const TRACK_PAYMENTS_ENDPOINT = "http://localhost:1111/track"
 
 const DEFAULT_SERVICE_HEALTH_ENDPOINT = "http://127.0.0.1:8001/payments/service-health"
 const FALLBACK_SERVICE_HEALTH_ENDPOINT = "http://127.0.0.1:8002/payments/service-health"
@@ -20,10 +26,12 @@ const FALLBACK_SERVICE_HEALTH_ENDPOINT = "http://127.0.0.1:8002/payments/service
 const HEALTH_CHECKER_INTERVAL = 6 * time.Second
 const MAX_TIMEOUT_IN_MS = 200
 
-const SERVER_ADDRESS = ":9999"
-
 var client http.Client = http.Client{
-	Timeout: 200 * time.Millisecond,
+	// Timeout: 200 * time.Millisecond,
+}
+
+var udpClient struct {
+	Conn *net.UDPConn
 }
 
 type PaymentRequest struct {
@@ -77,87 +85,6 @@ var retryQueue = RetryQueue{
 	C: make(chan Retry),
 }
 
-type StatsTracker struct {
-	Default                 PaymentsSummary `json:"default"`
-	Fallback                PaymentsSummary `json:"fallback"`
-	DefaultAmountsWithTime  []AmountWithTime
-	FallbackAmountsWithTime []AmountWithTime
-	mu                      sync.Mutex
-}
-
-func (st *StatsTracker) TrackDefault(amount float64, now time.Time) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-
-	st.Default.TotalRequests++
-	st.Default.TotalAmount += amount
-	st.DefaultAmountsWithTime = append(st.DefaultAmountsWithTime, AmountWithTime{amount, now})
-}
-
-func (st *StatsTracker) TrackFallback(amount float64, now time.Time) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-
-	st.Fallback.TotalRequests++
-	st.Fallback.TotalAmount += amount
-	st.FallbackAmountsWithTime = append(st.FallbackAmountsWithTime, AmountWithTime{amount, now})
-}
-
-func (st *StatsTracker) RangedSummary(from, to *time.Time) CombinedPaymentsSummary {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-
-	var amountDefault, amountFallback float64
-	var requestsDefault, requestsFallback int
-
-	for _, p := range st.DefaultAmountsWithTime {
-		inRange := true
-
-		if from != nil && p.Time.Before(*from) {
-			inRange = false
-		}
-
-		if to != nil && p.Time.After(*to) {
-			inRange = false
-		}
-
-		if inRange {
-			amountDefault += p.Amount
-			requestsDefault++
-		}
-	}
-
-	for _, p := range st.FallbackAmountsWithTime {
-		inRange := true
-
-		if from != nil && p.Time.Before(*from) {
-			inRange = false
-		}
-
-		if to != nil && p.Time.After(*to) {
-			inRange = false
-		}
-
-		if inRange {
-			amountFallback += p.Amount
-			requestsFallback++
-		}
-	}
-
-	return CombinedPaymentsSummary{
-		Default: PaymentsSummary{
-			TotalAmount:   amountDefault,
-			TotalRequests: requestsDefault,
-		},
-		Fallback: PaymentsSummary{
-			TotalAmount:   amountFallback,
-			TotalRequests: requestsFallback,
-		},
-	}
-}
-
-var statsTracker = StatsTracker{}
-
 func tryPost(endpoint string, pr *PaymentRequest, now time.Time) error {
 	pr.RequestedAt = now.Format(time.RFC3339Nano)
 
@@ -179,6 +106,22 @@ func tryPost(endpoint string, pr *PaymentRequest, now time.Time) error {
 	return nil
 }
 
+type TrackRequest struct {
+	Processor string  `json:"processor"`
+	Amount    float64 `json:"amount"`
+	Time      string  `json:"time"`
+}
+
+func trackPayment(pr PaymentRequest, processor string) {
+	message := fmt.Sprintf("t%s;%f;%s\n", processor, pr.Amount, pr.RequestedAt)
+
+	_, err := udpClient.Conn.Write([]byte(message))
+	if err != nil {
+		log.Printf("sending message to tracker: %v\n", err)
+		return
+	}
+}
+
 func tryProcessing(pr PaymentRequest) error {
 	if healthChecker.Default.Failing && healthChecker.Fallback.Failing {
 		return errors.New("both processors are down")
@@ -189,7 +132,7 @@ func tryProcessing(pr PaymentRequest) error {
 		err := tryPost(DEFAULT_PAYMENTS_ENDPOINT, &pr, now)
 
 		if err == nil {
-			go statsTracker.TrackDefault(pr.Amount, now)
+			go trackPayment(pr, "default")
 			return nil
 		}
 	}
@@ -199,7 +142,7 @@ func tryProcessing(pr PaymentRequest) error {
 		err := tryPost(FALLBACK_PAYMENTS_ENDPOINT, &pr, now)
 
 		if err == nil {
-			go statsTracker.TrackFallback(pr.Amount, now)
+			go trackPayment(pr, "fallback")
 			return nil
 		} else {
 			return err
@@ -231,7 +174,7 @@ func payments(w http.ResponseWriter, r *http.Request) {
 	elapsed := time.Since(begin)
 
 	if elapsed > 2*time.Millisecond {
-		log.Printf("slow: %v\n", elapsed)
+		log.Printf("slow payments: %v\n", elapsed)
 	}
 
 	return
@@ -240,41 +183,66 @@ func payments(w http.ResponseWriter, r *http.Request) {
 func paymentsSummary(w http.ResponseWriter, r *http.Request) {
 	begin := time.Now()
 
-	fromString := r.URL.Query().Get("from")
-	toString := r.URL.Query().Get("to")
+	from := r.URL.Query().Get("from")
+	to := r.URL.Query().Get("to")
 
-	if fromString == "" && toString == "" {
-		statsTracker.Default.TotalAmount = float64(int(statsTracker.Default.TotalAmount*10)) / 10
-		statsTracker.Fallback.TotalAmount = float64(int(statsTracker.Fallback.TotalAmount*10)) / 10
+	message := fmt.Sprintf("s%s;%s\n", from, to)
 
-		ps := CombinedPaymentsSummary{
-			Default:  statsTracker.Default,
-			Fallback: statsTracker.Fallback,
-		}
-
-		json.NewEncoder(w).Encode(ps)
-
-		elapsed := time.Since(begin)
-
-		log.Printf("summary took %v to calculate all\n", elapsed)
+	_, err := udpClient.Conn.Write([]byte(message))
+	if err != nil {
+		log.Printf("sending message to tracker: %v\n", err)
 		return
 	}
 
-	var from, to *time.Time
-	if toString != "" {
-		parsed, _ := time.Parse(time.RFC3339Nano, toString)
-		to = &parsed
+	response, err := bufio.NewReader(udpClient.Conn).ReadString('\n')
+	if err != nil {
+		log.Printf("reading from tracker: %v\n", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
 	}
 
-	if fromString != "" {
-		parsed, _ := time.Parse(time.RFC3339Nano, fromString)
-		from = &parsed
+	data := strings.Split(response[:len(response)-1], ";")
+	defaultRequests, err := strconv.ParseInt(data[0], 10, 64)
+	if err != nil {
+		log.Printf("parsing integer: %v\n", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defaultAmount, err := strconv.ParseFloat(data[1], 64)
+	if err != nil {
+		log.Printf("parsing float: %v\n", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
 	}
 
-	json.NewEncoder(w).Encode(statsTracker.RangedSummary(from, to))
+	fallbackRequests, err := strconv.ParseInt(data[2], 10, 64)
+	if err != nil {
+		log.Printf("parsing integer: %v\n", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	fallbackAmount, err := strconv.ParseFloat(data[3], 64)
+	if err != nil {
+		log.Printf("parsing float: %v\n", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	err = json.NewEncoder(w).Encode(CombinedPaymentsSummary{
+		Default:  PaymentsSummary{int(defaultRequests), defaultAmount},
+		Fallback: PaymentsSummary{int(fallbackRequests), fallbackAmount},
+	})
+	if err != nil {
+		log.Printf("encoding json: %v\n", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
 
 	elapsed := time.Since(begin)
-	log.Printf("summary took %v to calculate\n", elapsed)
+
+	if elapsed > 2*time.Millisecond {
+		log.Printf("slow summary: %v\n", elapsed)
+	}
 }
 
 type ServiceHealth struct {
@@ -306,6 +274,20 @@ func (hc *HealthChecker) check() {
 var healthChecker HealthChecker
 
 func main() {
+	serverAddress := os.Getenv("ADDRESS")
+
+	udpAddr, err := net.ResolveUDPAddr("udp", ":1111")
+	if err != nil {
+		log.Printf("resolving payments tracker service address: %v\n", err)
+		return
+	}
+
+	udpClient.Conn, err = net.DialUDP("udp", nil, udpAddr)
+	if err != nil {
+		log.Printf("establishing udp connection with payments tracker: %v\n", err)
+		return
+	}
+
 	http.HandleFunc("/payments", payments)
 	http.HandleFunc("/payments-summary", paymentsSummary)
 
@@ -323,5 +305,5 @@ func main() {
 		}
 	}()
 
-	http.ListenAndServe(SERVER_ADDRESS, nil)
+	http.ListenAndServe(serverAddress, nil)
 }
