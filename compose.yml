@@ -1,0 +1,74 @@
+services:
+  api-1:
+    hostname: api-1
+    image: gabrieleiro/rinha-de-backend-2025-api
+    networks:
+      - rinha-de-backend-2025
+      - payment-processor
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "50MB"
+    ports:
+      - "8888:80"
+    environment:
+      ADDRESS: ":8888"
+      DEFAULT_PROCESSOR_URL: "http://payment-processor-default:8080"
+      FALLBACk_PROCESSOR_URL: "http://payment-processor-fallback:8080"
+      PORT: "80"
+
+  api-2:
+    hostname: api-2
+    image: gabrieleiro/rinha-de-backend-2025-api
+    networks:
+      - payment-processor
+      - rinha-de-backend-2025
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "50MB"
+    ports:
+      - "7777:80"
+    environment:
+      ADDRESS: ":7777"
+      DEFAULT_PROCESSOR_URL: "http://payment-processor-default:8080"
+      FALLBACk_PROCESSOR_URL: "http://payment-processor-fallback:8080"
+      PORT: "80"
+
+  load-balancer:
+    image: gabrieleiro/rinha-de-backend-2025-load-balancer
+    networks:
+      - rinha-de-backend-2025
+    deploy:
+      resources:
+        limits:
+          cpus: "0.3"
+          memory: "50MB"
+    ports:
+      - "9999:9999"
+    environment:
+      ADDRESS: ":9999"
+      SERVERS: "http://api-1:8888,http://api-2:7777"
+
+  tracker:
+    image: gabrieleiro/rinha-de-backend-2025-tracker
+    networks:
+      - rinha-de-backend-2025
+    deploy:
+      resources:
+        limits:
+          cpus: "0.2"
+          memory: "50MB"
+    ports:
+      - "1111:1111/udp"
+    environment:
+      ADDRESS: ":1111"
+
+networks:
+  rinha-de-backend-2025:
+    name: rinha-de-backend-2025
+    driver: bridge
+  payment-processor:
+    external: true
