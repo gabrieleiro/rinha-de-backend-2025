@@ -10,8 +10,6 @@ import (
 	"strings"
 )
 
-const LOAD_BALANCER_ADDRESS = ":9999"
-
 var SERVERS = []ServerInfo{}
 
 type ServerInfo struct {
@@ -24,6 +22,7 @@ func pickServer() ServerInfo {
 
 func main() {
 	servers := strings.Split(os.Getenv("SERVERS"), ",")
+	address := os.Getenv("ADDRESS")
 
 	for _, s := range servers {
 		serverUrl, err := url.Parse(s)
@@ -47,5 +46,8 @@ func main() {
 		s.Connection.ServeHTTP(w, r)
 	})
 
-	http.ListenAndServe(LOAD_BALANCER_ADDRESS, nil)
+	err := http.ListenAndServe(address, nil)
+	if err != nil {
+		log.Printf("listening on address %s: %v\n", address, err)
+	}
 }

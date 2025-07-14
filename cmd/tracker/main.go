@@ -1,11 +1,9 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -128,37 +126,6 @@ func (t *Tracker) RangedSummary(from, to *time.Time) CombinedPaymentsSummary {
 			TotalRequests: requestsFallback,
 		},
 	}
-}
-
-func summary(w http.ResponseWriter, r *http.Request) {
-	fromString := r.URL.Query().Get("from")
-	toString := r.URL.Query().Get("to")
-
-	if fromString == "" && toString == "" {
-		tracker.Default.TotalAmount = float64(int(tracker.Default.TotalAmount*10)) / 10
-		tracker.Fallback.TotalAmount = float64(int(tracker.Fallback.TotalAmount*10)) / 10
-
-		ps := CombinedPaymentsSummary{
-			Default:  tracker.Default,
-			Fallback: tracker.Fallback,
-		}
-
-		json.NewEncoder(w).Encode(ps)
-		return
-	}
-
-	var from, to *time.Time
-	if toString != "" {
-		parsed, _ := time.Parse(time.RFC3339Nano, toString)
-		to = &parsed
-	}
-
-	if fromString != "" {
-		parsed, _ := time.Parse(time.RFC3339Nano, fromString)
-		from = &parsed
-	}
-
-	json.NewEncoder(w).Encode(tracker.RangedSummary(from, to))
 }
 
 func main() {

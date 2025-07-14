@@ -6,28 +6,35 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
-const DEFAULT_PAYMENTS_ENDPOINT = "http://127.0.0.1:8001/payments"
-const FALLBACK_PAYMENTS_ENDPOINT = "http://127.0.0.1:8002/payments"
-const PAYMENTS_SUMMARY_ENDPOINT = "http://localhost:1111/summary"
-const TRACK_PAYMENTS_ENDPOINT = "http://localhost:1111/track"
+var DEFAULT_PROCESSOR_URL = os.Getenv("DEFAULT_PROCESSOR_URL")
+var DEFAULT_PAYMENTS_ENDPOINT = DEFAULT_PROCESSOR_URL + "/payments"
+var DEFAULT_SERVICE_HEALTH_ENDPOINT = DEFAULT_PROCESSOR_URL + "/payments/service-health"
 
-const DEFAULT_SERVICE_HEALTH_ENDPOINT = "http://127.0.0.1:8001/payments/service-health"
-const FALLBACK_SERVICE_HEALTH_ENDPOINT = "http://127.0.0.1:8002/payments/service-health"
+var FALLBACK_PROCESSOR_URL = os.Getenv("FALLBACK_PROCESSOR_URL")
+var FALLBACK_PAYMENTS_ENDPOINT = FALLBACK_PROCESSOR_URL + "/payments"
+var FALLBACK_SERVICE_HEALTH_ENDPOINT = FALLBACK_PROCESSOR_URL + "/service-health"
+
+var TRACKER_URL = os.Getenv("TRACKER_URL")
+var PAYMENTS_SUMMARY_ENDPOINT = TRACKER_URL + "/summary"
+var TRACK_PAYMENTS_ENDPOINT = TRACKER_URL + "/track"
 
 const HEALTH_CHECKER_INTERVAL = 6 * time.Second
 const MAX_TIMEOUT_IN_MS = 200
 
 var client http.Client = http.Client{
-	// Timeout: 200 * time.Millisecond,
+	Timeout: 200 * time.Millisecond,
 }
 
 var udpClient struct {
@@ -59,30 +66,12 @@ func (pr PaymentRequest) String() string {
 	return fmt.Sprintf("%s\n%d", pr.CorrelationID, pr.Amount)
 }
 
-type RetryQueue struct {
-	C chan Retry
-}
+var paymentWorkerChan chan PaymentRequest = make(chan PaymentRequest, 10_000)
+var retriesChan chan PaymentRequest = make(chan PaymentRequest, 1000)
 
 type Request struct {
 	w http.ResponseWriter
 	r *http.Request
-}
-
-type Retry struct {
-	Pr PaymentRequest
-}
-
-func (rq *RetryQueue) Push(pr PaymentRequest) {
-	rq.C <- Retry{Pr: pr}
-}
-
-func (rq *RetryQueue) Consume() {
-	r := <-rq.C
-	tryProcessing(r.Pr)
-}
-
-var retryQueue = RetryQueue{
-	C: make(chan Retry),
 }
 
 func tryPost(endpoint string, pr *PaymentRequest, now time.Time) error {
@@ -132,7 +121,7 @@ func tryProcessing(pr PaymentRequest) error {
 		err := tryPost(DEFAULT_PAYMENTS_ENDPOINT, &pr, now)
 
 		if err == nil {
-			go trackPayment(pr, "default")
+			trackPayment(pr, "default")
 			return nil
 		}
 	}
@@ -142,7 +131,7 @@ func tryProcessing(pr PaymentRequest) error {
 		err := tryPost(FALLBACK_PAYMENTS_ENDPOINT, &pr, now)
 
 		if err == nil {
-			go trackPayment(pr, "fallback")
+			trackPayment(pr, "fallback")
 			return nil
 		} else {
 			return err
@@ -152,37 +141,104 @@ func tryProcessing(pr PaymentRequest) error {
 	return nil
 }
 
-func payments(w http.ResponseWriter, r *http.Request) {
-	begin := time.Now()
+func parseJson(r io.Reader) (string, float64, error) {
+	var amount float64
+	var correlationId string
 
+	buffer, err := io.ReadAll(r)
+	if err != nil {
+		return correlationId, amount, err
+	}
+
+	for i := 0; i < len(buffer); i++ {
+		c := rune(buffer[i])
+		for c == ' ' || c == '\n' || c == '\t' {
+			i++
+			c = rune(buffer[i])
+		}
+
+		if c != '"' {
+			continue
+		}
+
+		i++
+		c = rune(buffer[i])
+
+		if c == 'c' { // correlationId
+			for c != ':' {
+				i++
+				c = rune(buffer[i])
+			}
+
+			for c != '"' {
+				i++
+				c = rune(buffer[i])
+			}
+
+			i++ // skip opening "
+			c = rune(buffer[i])
+
+			stringStart := i
+
+			for c != '"' {
+				i++
+				c = rune(buffer[i])
+			}
+
+			correlationId = string(buffer[stringStart:i])
+		} else if c == 'a' { // amount
+			for c != ':' {
+				i++
+				c = rune(buffer[i])
+			}
+
+			for !unicode.IsDigit(c) {
+				i++
+				c = rune(buffer[i])
+			}
+
+			numberStart := i
+
+			for unicode.IsDigit(c) {
+				i++
+				c = rune(buffer[i])
+			}
+
+			if c == '.' {
+				i++
+				c = rune(buffer[i])
+			}
+
+			for !unicode.IsDigit(c) {
+				i++
+				c = rune(buffer[i])
+			}
+
+			amount, err = strconv.ParseFloat(string(buffer[numberStart:i]), 64)
+			if err != nil {
+				return correlationId, amount, errors.New("parsing float")
+			}
+		}
+	}
+
+	return correlationId, amount, nil
+}
+
+func payments(w http.ResponseWriter, r *http.Request) {
 	var pr PaymentRequest
 
-	err := json.NewDecoder(r.Body).Decode(&pr)
+	var err error
+	pr.CorrelationID, pr.Amount, err = parseJson(r.Body)
 	if err != nil {
 		log.Printf("decoding json: %v\n", err)
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
-	go func() {
-		err = tryProcessing(pr)
-		if err != nil {
-			retryQueue.Push(pr)
-		}
-	}()
-
-	elapsed := time.Since(begin)
-
-	if elapsed > 2*time.Millisecond {
-		log.Printf("slow payments: %v\n", elapsed)
-	}
-
-	return
+	paymentWorkerChan <- pr
 }
 
 func paymentsSummary(w http.ResponseWriter, r *http.Request) {
-	begin := time.Now()
-
 	from := r.URL.Query().Get("from")
 	to := r.URL.Query().Get("to")
 
@@ -237,12 +293,6 @@ func paymentsSummary(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-
-	elapsed := time.Since(begin)
-
-	if elapsed > 2*time.Millisecond {
-		log.Printf("slow summary: %v\n", elapsed)
-	}
 }
 
 type ServiceHealth struct {
@@ -291,11 +341,28 @@ func main() {
 	http.HandleFunc("/payments", payments)
 	http.HandleFunc("/payments-summary", paymentsSummary)
 
-	go func() {
-		for {
-			retryQueue.Consume()
-		}
-	}()
+	for i := 0; i < 150; i++ {
+		go func() {
+			for pr := range paymentWorkerChan {
+				err := tryProcessing(pr)
+				// retry
+				if err != nil {
+					retriesChan <- pr
+				}
+			}
+		}()
+	}
+
+	for i := 0; i < 150; i++ {
+		go func() {
+			for retry := range retriesChan {
+				err := tryProcessing(retry)
+				if err != nil {
+					retriesChan <- retry
+				}
+			}
+		}()
+	}
 
 	go func() {
 		ticker := time.NewTicker(HEALTH_CHECKER_INTERVAL)
