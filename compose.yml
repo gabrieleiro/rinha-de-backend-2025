@@ -52,7 +52,7 @@ services:
       - "9999:9999"
     environment:
       ADDRESS: ":9999"
-      SERVERS: "http://api-1:8888,http://api-2:7777"
+      SERVERS: "api-1:8888,api-2:7777"
 
   tracker:
     hostname: tracker
