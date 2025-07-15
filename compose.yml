@@ -15,7 +15,8 @@ services:
     environment:
       ADDRESS: ":8888"
       DEFAULT_PROCESSOR_URL: "http://payment-processor-default:8080"
-      FALLBACk_PROCESSOR_URL: "http://payment-processor-fallback:8080"
+      FALLBACK_PROCESSOR_URL: "http://payment-processor-fallback:8080"
+      TRACKER_URL: "tracker:1111"
       PORT: "80"
 
   api-2:
@@ -34,7 +35,8 @@ services:
     environment:
       ADDRESS: ":7777"
       DEFAULT_PROCESSOR_URL: "http://payment-processor-default:8080"
-      FALLBACk_PROCESSOR_URL: "http://payment-processor-fallback:8080"
+      FALLBACK_PROCESSOR_URL: "http://payment-processor-fallback:8080"
+      TRACKER_URL: "tracker:1111"
       PORT: "80"
 
   load-balancer:
@@ -53,6 +55,7 @@ services:
       SERVERS: "http://api-1:8888,http://api-2:7777"
 
   tracker:
+    hostname: tracker
     image: gabrieleiro/rinha-de-backend-2025-tracker
     networks:
       - rinha-de-backend-2025
@@ -61,6 +64,8 @@ services:
         limits:
           cpus: "0.2"
           memory: "50MB"
+    expose:
+      - "1111/udp"
     ports:
       - "1111:1111/udp"
     environment:

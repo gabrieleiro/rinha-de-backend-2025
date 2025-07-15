@@ -66,7 +66,7 @@ func (pr PaymentRequest) String() string {
 	return fmt.Sprintf("%s\n%d", pr.CorrelationID, pr.Amount)
 }
 
-var paymentWorkerChan chan PaymentRequest = make(chan PaymentRequest, 10_000)
+var paymentWorkerChan chan PaymentRequest = make(chan PaymentRequest, 1000)
 var retriesChan chan PaymentRequest = make(chan PaymentRequest, 1000)
 
 type Request struct {
@@ -235,7 +235,9 @@ func payments(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	paymentWorkerChan <- pr
+	go func() {
+		paymentWorkerChan <- pr
+	}()
 }
 
 func paymentsSummary(w http.ResponseWriter, r *http.Request) {
@@ -326,7 +328,7 @@ var healthChecker HealthChecker
 func main() {
 	serverAddress := os.Getenv("ADDRESS")
 
-	udpAddr, err := net.ResolveUDPAddr("udp", ":1111")
+	udpAddr, err := net.ResolveUDPAddr("udp", TRACKER_URL)
 	if err != nil {
 		log.Printf("resolving payments tracker service address: %v\n", err)
 		return
@@ -341,7 +343,7 @@ func main() {
 	http.HandleFunc("/payments", payments)
 	http.HandleFunc("/payments-summary", paymentsSummary)
 
-	for i := 0; i < 150; i++ {
+	for i := 0; i < 100; i++ {
 		go func() {
 			for pr := range paymentWorkerChan {
 				err := tryProcessing(pr)
@@ -353,7 +355,7 @@ func main() {
 		}()
 	}
 
-	for i := 0; i < 150; i++ {
+	for i := 0; i < 100; i++ {
 		go func() {
 			for retry := range retriesChan {
 				err := tryProcessing(retry)
