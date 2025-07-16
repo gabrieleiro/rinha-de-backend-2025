@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -73,7 +74,7 @@ func (pr PaymentRequest) String() string {
 	return fmt.Sprintf("%s\n%d", pr.CorrelationID, pr.Amount)
 }
 
-var paymentWorkerChan chan PaymentRequest = make(chan PaymentRequest, 1000)
+var paymentWorkerChan chan PaymentRequest = make(chan PaymentRequest, 10_000)
 var retriesChan chan PaymentRequest = make(chan PaymentRequest, 1000)
 
 type Request struct {
@@ -232,20 +233,31 @@ func parseJson(buffer []byte) (string, float64, error) {
 	return correlationId, amount, nil
 }
 
-func payments(conn net.Conn, correlationId string, amount float64) {
+func payments(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Printf("reading request body: %v\n", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	correlationId, amount, err := parseJson(bodyBytes)
+
 	go func() {
 		paymentWorkerChan <- PaymentRequest{
 			Amount:        amount,
 			CorrelationID: correlationId,
 		}
 	}()
-
-	conn.Write([]byte(HTTP_OK))
 }
 
-func paymentsSummary(conn net.Conn, from, to string) {
-	var response bytes.Buffer
-	message := fmt.Sprintf("s%s;%s\n", from, to)
+func paymentsSummary(w http.ResponseWriter, r *http.Request) {
+	fromString := r.URL.Query().Get("from")
+	toString := r.URL.Query().Get("to")
+
+	message := fmt.Sprintf("s%s;%s\n", fromString, toString)
 
 	_, err := udpClient.Conn.Write([]byte(message))
 	if err != nil {
@@ -256,12 +268,8 @@ func paymentsSummary(conn net.Conn, from, to string) {
 	trackerResponse, err := bufio.NewReader(udpClient.Conn).ReadString('\n')
 	if err != nil {
 		log.Printf("reading from tracker: %v\n", err)
-		response.WriteString(HTTP_INTERNAL_SERVER_ERROR)
-		response.WriteString("\r\n")
-		_, err = conn.Write(response.Bytes())
-		if err != nil {
-			log.Printf("writing http response: %v\n", err)
-		}
+
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
@@ -269,51 +277,31 @@ func paymentsSummary(conn net.Conn, from, to string) {
 	defaultRequests, err := strconv.ParseInt(data[0], 10, 64)
 	if err != nil {
 		log.Printf("parsing integer: %v\n", err)
-		response.WriteString(HTTP_INTERNAL_SERVER_ERROR)
-		response.WriteString("\r\n")
-		_, err = conn.Write(response.Bytes())
-		if err != nil {
-			log.Printf("writing http response: %v\n", err)
-		}
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 	defaultAmount, err := strconv.ParseFloat(data[1], 64)
 	if err != nil {
 		log.Printf("parsing float: %v\n", err)
-		response.WriteString(HTTP_INTERNAL_SERVER_ERROR)
-		response.WriteString("\r\n")
-		_, err = conn.Write(response.Bytes())
-		if err != nil {
-			log.Printf("writing http response: %v\n", err)
-		}
+
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
 	fallbackRequests, err := strconv.ParseInt(data[2], 10, 64)
 	if err != nil {
 		log.Printf("parsing integer: %v\n", err)
-		response.WriteString(HTTP_INTERNAL_SERVER_ERROR)
-		response.WriteString("\r\n")
-		_, err = conn.Write(response.Bytes())
-		if err != nil {
-			log.Printf("writing http response: %v\n", err)
-		}
+
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 	fallbackAmount, err := strconv.ParseFloat(data[3], 64)
 	if err != nil {
 		log.Printf("parsing float: %v\n", err)
-		response.WriteString(HTTP_INTERNAL_SERVER_ERROR)
-		response.WriteString("\r\n")
-		_, err = conn.Write(response.Bytes())
-		if err != nil {
-			log.Printf("writing http response: %v\n", err)
-		}
+
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-
-	response.WriteString(HTTP_OK)
-	response.WriteString("\r\n")
 
 	j := fmt.Sprintf(`{
 	"default": {
@@ -326,12 +314,7 @@ func paymentsSummary(conn net.Conn, from, to string) {
 	}
 }`, int(defaultRequests), defaultAmount, int(fallbackRequests), fallbackAmount)
 
-	response.WriteString(j)
-
-	_, err = conn.Write(response.Bytes())
-	if err != nil {
-		log.Printf("writing http response: %v\n", err)
-	}
+	w.Write([]byte(j))
 }
 
 type ServiceHealth struct {
@@ -382,132 +365,6 @@ func (hc *HealthChecker) check() {
 
 var healthChecker HealthChecker
 
-func handleTcpConnection(conn net.Conn) {
-	defer conn.Close()
-
-	incommingMessage := make([]byte, MAX_SIZE_OF_TCP_PACKET)
-	_, err := conn.Read(incommingMessage)
-	if err != nil {
-		log.Printf("reading tcp packet: %v\n", err)
-		return
-	}
-
-	var i int
-
-	// skip verb
-	for incommingMessage[i] != ' ' {
-		i++
-	}
-
-	i++
-
-	beginTarget := i
-
-	if bytes.Equal([]byte("/payments-summary"), incommingMessage[beginTarget:beginTarget+17]) {
-		i += 17
-
-		var from, to string
-		if incommingMessage[i] == '?' {
-			i++
-			beginFirstQueryParam := i
-
-			for incommingMessage[i] != '=' {
-				i++
-			}
-			firstParam := incommingMessage[beginFirstQueryParam:i]
-
-			i++
-
-			beginFirstArgValue := i
-			for incommingMessage[i] != '\r' && incommingMessage[i] != '&' && incommingMessage[i] != ' ' {
-				i++
-			}
-
-			firstParamValue := incommingMessage[beginFirstArgValue:i]
-
-			var secondParam, secondParamValue []byte
-			if incommingMessage[i] == '&' {
-				log.Printf("yes &")
-				i++
-				beginSecondParam := i
-
-				for incommingMessage[i] != '=' {
-					i++
-				}
-
-				secondParam = incommingMessage[beginSecondParam:i]
-
-				i++
-				beginSecondParamValue := i
-				for incommingMessage[i] != ' ' {
-					i++
-				}
-
-				secondParamValue = incommingMessage[beginSecondParamValue:i]
-				log.Printf("second param value: %s\n", secondParamValue)
-			}
-
-			if bytes.Equal(firstParam, []byte("from")) {
-				from = string(firstParamValue)
-				if err != nil {
-					log.Printf("parsing timestamp: %v\n", err)
-					return
-				}
-			} else if bytes.Equal(firstParam, []byte("to")) {
-				to = string(firstParamValue)
-				if err != nil {
-					log.Printf("parsing timestamp: %v\n", err)
-					return
-				}
-			}
-
-			if len(secondParam) > 0 {
-				if bytes.Equal(secondParam, []byte("from")) {
-					from = string(secondParamValue)
-					if err != nil {
-						log.Printf("parsing timestamp: %v\n", err)
-						return
-					}
-				} else if bytes.Equal(secondParam, []byte("to")) {
-					to = string(secondParamValue)
-					if err != nil {
-						log.Printf("parsing timestamp: %v\n", err)
-						return
-					}
-				}
-			}
-
-		}
-
-		paymentsSummary(conn, from, to)
-		return
-	} else if bytes.Equal([]byte("/payments"), incommingMessage[beginTarget:beginTarget+9]) {
-		for incommingMessage[i] != '\n' {
-			i++
-		}
-		i += 2 // skip body separator \r\n
-
-		correlationId, amount, err := parseJson(incommingMessage[i:])
-		if err != nil {
-			log.Printf("parsing json: %v\n", err)
-			return
-		}
-
-		conn.Write([]byte(HTTP_OK))
-
-		go func() {
-			paymentWorkerChan <- PaymentRequest{
-				Amount:        amount,
-				CorrelationID: correlationId,
-			}
-		}()
-
-		return
-	}
-
-	conn.Write([]byte(HTTP_NOT_FOUND))
-}
-
 func main() {
 	serverAddress := os.Getenv("ADDRESS")
 
@@ -524,7 +381,7 @@ func main() {
 	}
 	defer udpClient.Conn.Close()
 
-	for i := 0; i < 100; i++ {
+	for i := 0; i < 1000; i++ {
 		go func() {
 			for pr := range paymentWorkerChan {
 				err := tryProcessing(pr)
@@ -535,6 +392,10 @@ func main() {
 			}
 		}()
 	}
+
+	http.HandleFunc("/payments", payments)
+	http.HandleFunc("/payments-summary", paymentsSummary)
+	http.ListenAndServe(serverAddress, nil)
 
 	for i := 0; i < 100; i++ {
 		go func() {
@@ -554,20 +415,4 @@ func main() {
 			healthChecker.check()
 		}
 	}()
-
-	tcpListener, err := net.Listen("tcp", serverAddress)
-	if err != nil {
-		log.Printf("listening on %s: %v\n", serverAddress, err)
-		return
-	}
-
-	for {
-		tcpConn, err := tcpListener.Accept()
-		if err != nil {
-			log.Printf("accepting tcp connection: %v\n", err)
-			continue
-		}
-
-		go handleTcpConnection(tcpConn)
-	}
 }
