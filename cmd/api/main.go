@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
+	"github.com/valyala/fasthttp"
 	"log"
 	"net"
 	"net/http"
@@ -233,17 +233,12 @@ func parseJson(buffer []byte) (string, float64, error) {
 	return correlationId, amount, nil
 }
 
-func payments(w http.ResponseWriter, r *http.Request) {
-	defer r.Body.Close()
-
-	bodyBytes, err := io.ReadAll(r.Body)
+func payments(ctx *fasthttp.RequestCtx) {
+	correlationId, amount, err := parseJson(ctx.PostBody())
 	if err != nil {
-		log.Printf("reading request body: %v\n", err)
-		w.WriteHeader(http.StatusInternalServerError)
+		ctx.SetStatusCode(500)
 		return
 	}
-
-	correlationId, amount, err := parseJson(bodyBytes)
 
 	go func() {
 		paymentWorkerChan <- PaymentRequest{
@@ -251,13 +246,17 @@ func payments(w http.ResponseWriter, r *http.Request) {
 			CorrelationID: correlationId,
 		}
 	}()
+
+	ctx.SetStatusCode(200)
 }
 
-func paymentsSummary(w http.ResponseWriter, r *http.Request) {
-	fromString := r.URL.Query().Get("from")
-	toString := r.URL.Query().Get("to")
+func paymentsSummary(ctx *fasthttp.RequestCtx) {
+	from := ctx.URI().QueryArgs().PeekBytes([]byte("from"))
+	to := ctx.URI().QueryArgs().PeekBytes([]byte("to"))
+	// fromString := r.URL.Query().Get("from")
+	// toString := r.URL.Query().Get("to")
 
-	message := fmt.Sprintf("s%s;%s\n", fromString, toString)
+	message := fmt.Sprintf("s%s;%s\n", string(from), string(to))
 
 	_, err := udpClient.Conn.Write([]byte(message))
 	if err != nil {
@@ -269,7 +268,7 @@ func paymentsSummary(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Printf("reading from tracker: %v\n", err)
 
-		w.WriteHeader(http.StatusInternalServerError)
+		ctx.SetStatusCode(500)
 		return
 	}
 
@@ -277,14 +276,14 @@ func paymentsSummary(w http.ResponseWriter, r *http.Request) {
 	defaultRequests, err := strconv.ParseInt(data[0], 10, 64)
 	if err != nil {
 		log.Printf("parsing integer: %v\n", err)
-		w.WriteHeader(http.StatusInternalServerError)
+		ctx.SetStatusCode(500)
 		return
 	}
 	defaultAmount, err := strconv.ParseFloat(data[1], 64)
 	if err != nil {
 		log.Printf("parsing float: %v\n", err)
 
-		w.WriteHeader(http.StatusInternalServerError)
+		ctx.SetStatusCode(500)
 		return
 	}
 
@@ -292,14 +291,14 @@ func paymentsSummary(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Printf("parsing integer: %v\n", err)
 
-		w.WriteHeader(http.StatusInternalServerError)
+		ctx.SetStatusCode(500)
 		return
 	}
 	fallbackAmount, err := strconv.ParseFloat(data[3], 64)
 	if err != nil {
 		log.Printf("parsing float: %v\n", err)
 
-		w.WriteHeader(http.StatusInternalServerError)
+		ctx.SetStatusCode(500)
 		return
 	}
 
@@ -314,7 +313,7 @@ func paymentsSummary(w http.ResponseWriter, r *http.Request) {
 	}
 }`, int(defaultRequests), defaultAmount, int(fallbackRequests), fallbackAmount)
 
-	w.Write([]byte(j))
+	ctx.WriteString(j)
 }
 
 type ServiceHealth struct {
@@ -365,6 +364,15 @@ func (hc *HealthChecker) check() {
 
 var healthChecker HealthChecker
 
+func requestHandler(ctx *fasthttp.RequestCtx) {
+	switch string(ctx.Path()) {
+	case "/payments":
+		payments(ctx)
+	case "/payments-summary":
+		paymentsSummary(ctx)
+	}
+}
+
 func main() {
 	serverAddress := os.Getenv("ADDRESS")
 
@@ -393,9 +401,10 @@ func main() {
 		}()
 	}
 
-	http.HandleFunc("/payments", payments)
-	http.HandleFunc("/payments-summary", paymentsSummary)
-	http.ListenAndServe(serverAddress, nil)
+	// http.HandleFunc("/payments", payments)
+	// http.HandleFunc("/payments-summary", paymentsSummary)
+
+	fasthttp.ListenAndServe(serverAddress, requestHandler)
 
 	for i := 0; i < 100; i++ {
 		go func() {
