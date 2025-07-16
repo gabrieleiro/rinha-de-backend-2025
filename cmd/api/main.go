@@ -13,11 +13,14 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 )
 
 const MAX_SIZE_OF_TCP_PACKET = 65535
+const TCP_CONNECTION_POOL_SIZE = 200
+
 const HTTP_OK = "HTTP/1.1 200 OK\r\n\r\n"
 const HTTP_INTERNAL_SERVER_ERROR = "HTTP/1.1 500 Internal Server Error\r\n"
 const HTTP_NOT_FOUND = "HTTP/1.1 404 Not Found\r\n\r\n"
@@ -91,6 +94,7 @@ func tryPost(endpoint string, pr *PaymentRequest, now time.Time) error {
 	if err != nil {
 		return err
 	}
+	defer response.Body.Close()
 
 	if response.StatusCode != http.StatusOK {
 		return errors.New(response.Status)
@@ -120,6 +124,10 @@ func tryProcessing(pr PaymentRequest) error {
 		return errors.New("both processors are down")
 	}
 
+	if healthChecker.Default.MinResponseTime > MAX_TIMEOUT_IN_MS && healthChecker.Fallback.MinResponseTime > MAX_TIMEOUT_IN_MS {
+		return errors.New("both processors are slow")
+	}
+
 	if !healthChecker.Default.Failing && healthChecker.Default.MinResponseTime < MAX_TIMEOUT_IN_MS {
 		now := time.Now().UTC()
 		err := tryPost(DEFAULT_PAYMENTS_ENDPOINT, &pr, now)
@@ -130,7 +138,7 @@ func tryProcessing(pr PaymentRequest) error {
 		}
 	}
 
-	if !healthChecker.Fallback.Failing {
+	if !healthChecker.Fallback.Failing && healthChecker.Default.MinResponseTime < MAX_TIMEOUT_IN_MS {
 		now := time.Now().UTC()
 		err := tryPost(FALLBACK_PAYMENTS_ENDPOINT, &pr, now)
 
@@ -208,12 +216,13 @@ func parseJson(buffer []byte) (string, float64, error) {
 				c = rune(buffer[i])
 			}
 
-			for !unicode.IsDigit(c) {
+			for unicode.IsDigit(c) {
 				i++
 				c = rune(buffer[i])
 			}
 
-			amount, err := strconv.ParseFloat(string(buffer[numberStart:i]), 64)
+			var err error
+			amount, err = strconv.ParseFloat(string(buffer[numberStart:i]), 64)
 			if err != nil {
 				return correlationId, amount, errors.New("parsing float")
 			}
@@ -224,10 +233,11 @@ func parseJson(buffer []byte) (string, float64, error) {
 }
 
 func payments(conn net.Conn, correlationId string, amount float64) {
-	var pr PaymentRequest
-
 	go func() {
-		paymentWorkerChan <- pr
+		paymentWorkerChan <- PaymentRequest{
+			Amount:        amount,
+			CorrelationID: correlationId,
+		}
 	}()
 
 	conn.Write([]byte(HTTP_OK))
@@ -335,19 +345,39 @@ type HealthChecker struct {
 }
 
 func (hc *HealthChecker) check() {
-	resp, err := http.Get(DEFAULT_SERVICE_HEALTH_ENDPOINT)
-	if err != nil {
-		log.Printf("checking default's health: %v", err)
-	} else {
-		json.NewDecoder(resp.Body).Decode(&hc.Default)
-	}
+	var wg sync.WaitGroup
+	wg.Add(2)
 
-	resp, err = http.Get(FALLBACK_SERVICE_HEALTH_ENDPOINT)
-	if err != nil {
-		log.Printf("checking fallback's health: %v", err)
-	} else {
+	go func() {
+		defer wg.Done()
+		resp, err := http.Get(DEFAULT_SERVICE_HEALTH_ENDPOINT)
+		if err != nil {
+			log.Printf("checking default's health: %v\n", err)
+		}
+
+		if resp != nil {
+			defer resp.Body.Close()
+		}
+
+		json.NewDecoder(resp.Body).Decode(&hc.Default)
+	}()
+
+	go func() {
+		defer wg.Done()
+		resp, err := http.Get(FALLBACK_SERVICE_HEALTH_ENDPOINT)
+		if err != nil {
+			log.Printf("checking fallback's health: %v\n", err)
+			return
+		}
+
+		if resp != nil {
+			defer resp.Body.Close()
+		}
+
 		json.NewDecoder(resp.Body).Decode(&hc.Fallback)
-	}
+	}()
+
+	wg.Wait()
 }
 
 var healthChecker HealthChecker
@@ -374,7 +404,7 @@ func handleTcpConnection(conn net.Conn) {
 	beginTarget := i
 
 	if bytes.Equal([]byte("/payments-summary"), incommingMessage[beginTarget:beginTarget+17]) {
-		i += 18
+		i += 17
 
 		var from, to string
 		if incommingMessage[i] == '?' {
@@ -389,15 +419,15 @@ func handleTcpConnection(conn net.Conn) {
 			i++
 
 			beginFirstArgValue := i
-			for incommingMessage[i] != '\r' && incommingMessage[i] != '&' {
+			for incommingMessage[i] != '\r' && incommingMessage[i] != '&' && incommingMessage[i] != ' ' {
 				i++
 			}
-			i++
 
 			firstParamValue := incommingMessage[beginFirstArgValue:i]
 
 			var secondParam, secondParamValue []byte
 			if incommingMessage[i] == '&' {
+				log.Printf("yes &")
 				i++
 				beginSecondParam := i
 
@@ -409,11 +439,12 @@ func handleTcpConnection(conn net.Conn) {
 
 				i++
 				beginSecondParamValue := i
-				for incommingMessage[i] != '\r' && incommingMessage[i] != '&' {
+				for incommingMessage[i] != ' ' {
 					i++
 				}
 
 				secondParamValue = incommingMessage[beginSecondParamValue:i]
+				log.Printf("second param value: %s\n", secondParamValue)
 			}
 
 			if bytes.Equal(firstParam, []byte("from")) {
@@ -437,7 +468,7 @@ func handleTcpConnection(conn net.Conn) {
 						log.Printf("parsing timestamp: %v\n", err)
 						return
 					}
-				} else if bytes.Equal(firstParam, []byte("to")) {
+				} else if bytes.Equal(secondParam, []byte("to")) {
 					to = string(secondParamValue)
 					if err != nil {
 						log.Printf("parsing timestamp: %v\n", err)
@@ -462,7 +493,15 @@ func handleTcpConnection(conn net.Conn) {
 			return
 		}
 
-		payments(conn, correlationId, amount)
+		conn.Write([]byte(HTTP_OK))
+
+		go func() {
+			paymentWorkerChan <- PaymentRequest{
+				Amount:        amount,
+				CorrelationID: correlationId,
+			}
+		}()
+
 		return
 	}
 
@@ -483,6 +522,8 @@ func main() {
 		log.Printf("establishing udp connection with payments tracker: %v\n", err)
 		return
 	}
+	defer udpClient.Conn.Close()
+
 	for i := 0; i < 100; i++ {
 		go func() {
 			for pr := range paymentWorkerChan {

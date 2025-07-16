@@ -79,6 +79,7 @@ func main() {
 			defer src.Close()
 
 			s := pickServer()
+			// dst, err := s.GetConnection()
 			dst, err := net.Dial("tcp", s.Address)
 			if err != nil {
 				log.Printf("dialing server %s: %v\n", s, err)
@@ -89,17 +90,24 @@ func main() {
 			wg.Add(2)
 
 			go func() {
+				defer (dst.(*net.TCPConn)).CloseRead()
 				defer wg.Done()
-				io.Copy(dst, src)
+				_, err := io.Copy(dst, src)
+				if err != nil {
+					log.Printf("err: %v\n", err)
+				}
 			}()
 
 			go func() {
+				defer (src.(*net.TCPConn)).CloseRead()
 				defer wg.Done()
-				io.Copy(src, dst)
+				_, err := io.Copy(src, dst)
+				if err != nil {
+					log.Printf("err: %v\n", err)
+				}
 			}()
 
 			wg.Wait()
-			s.RecycleConnection(dst)
 		}()
 	}
 }
