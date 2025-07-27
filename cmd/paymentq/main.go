@@ -25,8 +25,8 @@ var FALLBACK_SERVICE_HEALTH_ENDPOINT = FALLBACK_PROCESSOR_URL + "/payments/servi
 
 const MAX_TIMEOUT_IN_MS = 200
 
-var paymentWorkerChan chan PaymentRequest = make(chan PaymentRequest, 10_000)
-var retriesChan chan PaymentRequest = make(chan PaymentRequest, 1000)
+var paymentsQueue chan PaymentRequest = make(chan PaymentRequest, 10_000)
+var retriesQueue chan PaymentRequest = make(chan PaymentRequest, 1000)
 
 var udpClient struct {
 	ListenerConn *net.UDPConn
@@ -186,6 +186,31 @@ func DialUDP(addressString string, conn **net.UDPConn) error {
 }
 
 func main() {
+	// queues
+	for i := 0; i < 1000; i++ {
+		go func() {
+			pr := <-paymentsQueue
+			err := tryProcessing(pr)
+
+			if err != nil {
+				retriesQueue <- pr
+				log.Printf("retrying")
+			}
+		}()
+	}
+
+	for i := 0; i < 1000; i++ {
+		go func() {
+			pr := <-retriesQueue
+			err := tryProcessing(pr)
+
+			if err != nil {
+				retriesQueue <- pr
+			}
+		}()
+	}
+
+	// networking
 	var err error
 	udpClient.ListenerConn, err = ListenUDP(os.Getenv("ADDRESS"))
 	if err != nil {
@@ -221,10 +246,7 @@ func main() {
 				return
 			}
 
-			err = tryProcessing(PaymentRequest{amount, params[0], ""})
-			if err != nil {
-				log.Printf("process error: %v\n", err)
-			}
+			paymentsQueue <- PaymentRequest{amount, params[0], ""}
 		}()
 	}
 
