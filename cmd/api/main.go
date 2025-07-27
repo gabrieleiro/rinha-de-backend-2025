@@ -2,8 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/valyala/fasthttp"
@@ -14,10 +12,11 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 	"unicode"
 )
+
+var AMOUNT float64 = 0
 
 const MAX_SIZE_OF_TCP_PACKET = 65535
 const TCP_CONNECTION_POOL_SIZE = 200
@@ -26,17 +25,11 @@ const HTTP_OK = "HTTP/1.1 200 OK\r\n\r\n"
 const HTTP_INTERNAL_SERVER_ERROR = "HTTP/1.1 500 Internal Server Error\r\n"
 const HTTP_NOT_FOUND = "HTTP/1.1 404 Not Found\r\n\r\n"
 
-var DEFAULT_PROCESSOR_URL = os.Getenv("DEFAULT_PROCESSOR_URL")
-var DEFAULT_PAYMENTS_ENDPOINT = DEFAULT_PROCESSOR_URL + "/payments"
-var DEFAULT_SERVICE_HEALTH_ENDPOINT = DEFAULT_PROCESSOR_URL + "/payments/service-health"
-
-var FALLBACK_PROCESSOR_URL = os.Getenv("FALLBACK_PROCESSOR_URL")
-var FALLBACK_PAYMENTS_ENDPOINT = FALLBACK_PROCESSOR_URL + "/payments"
-var FALLBACK_SERVICE_HEALTH_ENDPOINT = FALLBACK_PROCESSOR_URL + "/payments/service-health"
-
 var TRACKER_URL = os.Getenv("TRACKER_URL")
 var PAYMENTS_SUMMARY_ENDPOINT = TRACKER_URL + "/summary"
 var TRACK_PAYMENTS_ENDPOINT = TRACKER_URL + "/track"
+
+var PAYMENT_QUEUE_URL = os.Getenv("PAYMENT_QUEUE_URL")
 
 const HEALTH_CHECKER_INTERVAL = 6 * time.Second
 const MAX_TIMEOUT_IN_MS = 200
@@ -46,7 +39,8 @@ var client http.Client = http.Client{
 }
 
 var udpClient struct {
-	Conn *net.UDPConn
+	QueueConn   *net.UDPConn
+	TrackerConn *net.UDPConn
 }
 
 type PaymentRequest struct {
@@ -58,11 +52,6 @@ type PaymentRequest struct {
 type CombinedPaymentsSummary struct {
 	Default  PaymentsSummary `json:"default"`
 	Fallback PaymentsSummary `json:"fallback"`
-}
-
-type AmountWithTime struct {
-	Amount float64
-	Time   time.Time
 }
 
 type PaymentsSummary struct {
@@ -82,80 +71,14 @@ type Request struct {
 	r *http.Request
 }
 
-func tryPost(endpoint string, pr *PaymentRequest, now time.Time) error {
-	pr.RequestedAt = now.Format(time.RFC3339Nano)
-
-	payload, err := json.Marshal(pr)
-	if err != nil {
-		log.Printf("encoding json: %v\n", err)
-		return err
-	}
-
-	response, err := client.Post(endpoint, "application/json", bytes.NewBuffer(payload))
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-
-	if response.StatusCode != http.StatusOK {
-		return errors.New(response.Status)
-	}
-
-	return nil
-}
-
 type TrackRequest struct {
 	Processor string  `json:"processor"`
 	Amount    float64 `json:"amount"`
 	Time      string  `json:"time"`
 }
 
-func trackPayment(pr PaymentRequest, processor string) {
-	message := fmt.Sprintf("t%s;%f;%s\n", processor, pr.Amount, pr.RequestedAt)
-
-	_, err := udpClient.Conn.Write([]byte(message))
-	if err != nil {
-		log.Printf("sending message to tracker: %v\n", err)
-		return
-	}
-}
-
-func tryProcessing(pr PaymentRequest) error {
-	if healthChecker.Default.Failing && healthChecker.Fallback.Failing {
-		return errors.New("both processors are down")
-	}
-
-	if healthChecker.Default.MinResponseTime > MAX_TIMEOUT_IN_MS && healthChecker.Fallback.MinResponseTime > MAX_TIMEOUT_IN_MS {
-		return errors.New("both processors are slow")
-	}
-
-	if !healthChecker.Default.Failing && healthChecker.Default.MinResponseTime < MAX_TIMEOUT_IN_MS {
-		now := time.Now().UTC()
-		err := tryPost(DEFAULT_PAYMENTS_ENDPOINT, &pr, now)
-
-		if err == nil {
-			trackPayment(pr, "default")
-			return nil
-		}
-	}
-
-	if !healthChecker.Fallback.Failing && healthChecker.Default.MinResponseTime < MAX_TIMEOUT_IN_MS {
-		now := time.Now().UTC()
-		err := tryPost(FALLBACK_PAYMENTS_ENDPOINT, &pr, now)
-
-		if err == nil {
-			trackPayment(pr, "fallback")
-			return nil
-		} else {
-			return err
-		}
-	}
-
-	return nil
-}
-
 func parseJson(buffer []byte) (string, float64, error) {
-	var amount float64
+	amount := AMOUNT
 	var correlationId string
 
 	for i := 0; i < len(buffer); i++ {
@@ -195,6 +118,10 @@ func parseJson(buffer []byte) (string, float64, error) {
 
 			correlationId = string(buffer[stringStart:i])
 		} else if c == 'a' { // amount
+			if amount != 0 {
+				break
+			}
+
 			for c != ':' {
 				i++
 				c = rune(buffer[i])
@@ -241,9 +168,11 @@ func payments(ctx *fasthttp.RequestCtx) {
 	}
 
 	go func() {
-		paymentWorkerChan <- PaymentRequest{
-			Amount:        amount,
-			CorrelationID: correlationId,
+		message := fmt.Sprintf("%s;%f\n", correlationId, amount)
+		_, err := udpClient.QueueConn.Write([]byte(message))
+		if err != nil {
+			log.Printf("sending message to payment queue: %v\n", err)
+			return
 		}
 	}()
 
@@ -253,18 +182,17 @@ func payments(ctx *fasthttp.RequestCtx) {
 func paymentsSummary(ctx *fasthttp.RequestCtx) {
 	from := ctx.URI().QueryArgs().PeekBytes([]byte("from"))
 	to := ctx.URI().QueryArgs().PeekBytes([]byte("to"))
-	// fromString := r.URL.Query().Get("from")
-	// toString := r.URL.Query().Get("to")
 
 	message := fmt.Sprintf("s%s;%s\n", string(from), string(to))
 
-	_, err := udpClient.Conn.Write([]byte(message))
+	_, err := udpClient.TrackerConn.Write([]byte(message))
 	if err != nil {
 		log.Printf("sending message to tracker: %v\n", err)
+		ctx.SetStatusCode(500)
 		return
 	}
 
-	trackerResponse, err := bufio.NewReader(udpClient.Conn).ReadString('\n')
+	trackerResponse, err := bufio.NewReader(udpClient.TrackerConn).ReadString('\n')
 	if err != nil {
 		log.Printf("reading from tracker: %v\n", err)
 
@@ -316,54 +244,6 @@ func paymentsSummary(ctx *fasthttp.RequestCtx) {
 	ctx.WriteString(j)
 }
 
-type ServiceHealth struct {
-	Failing         bool `json:"failing"`
-	MinResponseTime int  `json:"minResponseTime"`
-}
-
-type HealthChecker struct {
-	Default  ServiceHealth
-	Fallback ServiceHealth
-}
-
-func (hc *HealthChecker) check() {
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		resp, err := http.Get(DEFAULT_SERVICE_HEALTH_ENDPOINT)
-		if err != nil {
-			log.Printf("checking default's health: %v\n", err)
-		}
-
-		if resp != nil {
-			defer resp.Body.Close()
-		}
-
-		json.NewDecoder(resp.Body).Decode(&hc.Default)
-	}()
-
-	go func() {
-		defer wg.Done()
-		resp, err := http.Get(FALLBACK_SERVICE_HEALTH_ENDPOINT)
-		if err != nil {
-			log.Printf("checking fallback's health: %v\n", err)
-			return
-		}
-
-		if resp != nil {
-			defer resp.Body.Close()
-		}
-
-		json.NewDecoder(resp.Body).Decode(&hc.Fallback)
-	}()
-
-	wg.Wait()
-}
-
-var healthChecker HealthChecker
-
 func requestHandler(ctx *fasthttp.RequestCtx) {
 	switch string(ctx.Path()) {
 	case "/payments":
@@ -373,55 +253,38 @@ func requestHandler(ctx *fasthttp.RequestCtx) {
 	}
 }
 
+func dialUDP(addressString string) (*net.UDPConn, error) {
+	udpAddr, err := net.ResolveUDPAddr("udp", addressString)
+	if err != nil {
+		return nil, err
+	}
+
+	conn, err := net.DialUDP("udp", nil, udpAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	return conn, nil
+}
+
 func main() {
 	serverAddress := os.Getenv("ADDRESS")
 
-	udpAddr, err := net.ResolveUDPAddr("udp", TRACKER_URL)
+	var err error
+	udpClient.TrackerConn, err = dialUDP(TRACKER_URL)
 	if err != nil {
-		log.Printf("resolving payments tracker service address: %v\n", err)
+		log.Printf("initing udp client: %v\n", err)
 		return
 	}
+	defer udpClient.TrackerConn.Close()
 
-	udpClient.Conn, err = net.DialUDP("udp", nil, udpAddr)
+	udpClient.QueueConn, err = dialUDP(PAYMENT_QUEUE_URL)
 	if err != nil {
-		log.Printf("establishing udp connection with payments tracker: %v\n", err)
+		log.Printf("initing udp client: %v\n", err)
 		return
 	}
-	defer udpClient.Conn.Close()
+	defer udpClient.QueueConn.Close()
 
-	for i := 0; i < 1000; i++ {
-		go func() {
-			for pr := range paymentWorkerChan {
-				err := tryProcessing(pr)
-				// retry
-				if err != nil {
-					retriesChan <- pr
-				}
-			}
-		}()
-	}
-
-	// http.HandleFunc("/payments", payments)
-	// http.HandleFunc("/payments-summary", paymentsSummary)
-
+	log.Printf("listening on port %v\n", serverAddress)
 	fasthttp.ListenAndServe(serverAddress, requestHandler)
-
-	for i := 0; i < 100; i++ {
-		go func() {
-			for retry := range retriesChan {
-				err := tryProcessing(retry)
-				if err != nil {
-					retriesChan <- retry
-				}
-			}
-		}()
-	}
-
-	go func() {
-		ticker := time.NewTicker(HEALTH_CHECKER_INTERVAL)
-
-		for range ticker.C {
-			healthChecker.check()
-		}
-	}()
 }
