@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
-	"github.com/valyala/fasthttp"
 	"log"
 	"net"
 	"net/http"
@@ -14,6 +13,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/valyala/fasthttp"
 )
 
 var AMOUNT float64 = 0

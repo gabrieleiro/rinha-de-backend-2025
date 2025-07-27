@@ -34,7 +34,7 @@ var udpClient struct {
 }
 
 var httpClient http.Client = http.Client{
-	Timeout: 200 * time.Millisecond,
+	Timeout: 2000 * time.Millisecond,
 }
 
 type PaymentRequest struct {
@@ -154,7 +154,7 @@ func tryProcessing(pr PaymentRequest) error {
 		}
 	}
 
-	return nil
+	return errors.New("undefined error")
 }
 
 func ListenUDP(addressString string) (*net.UDPConn, error) {
@@ -189,23 +189,24 @@ func main() {
 	// queues
 	for i := 0; i < 1000; i++ {
 		go func() {
-			pr := <-paymentsQueue
-			err := tryProcessing(pr)
+			for pr := range paymentsQueue {
+				err := tryProcessing(pr)
 
-			if err != nil {
-				retriesQueue <- pr
-				log.Printf("retrying")
+				if err != nil {
+					retriesQueue <- pr
+				}
 			}
 		}()
 	}
 
-	for i := 0; i < 1000; i++ {
+	for i := 0; i < 100; i++ {
 		go func() {
-			pr := <-retriesQueue
-			err := tryProcessing(pr)
+			for pr := range retriesQueue {
+				err := tryProcessing(pr)
 
-			if err != nil {
-				retriesQueue <- pr
+				if err != nil {
+					retriesQueue <- pr
+				}
 			}
 		}()
 	}
