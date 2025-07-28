@@ -2,9 +2,7 @@ package main
 
 import (
 	"bytes"
-	"sync"
 
-	"io"
 	"log"
 	"math/rand"
 	"net"
@@ -113,27 +111,23 @@ func main() {
 					log.Printf("redirecting POST data: %v\n", err)
 					return
 				}
+
+				dst.Read(make([]byte, 300))
 			} else {
-				var wg sync.WaitGroup
-				wg.Add(2)
+				_, err := dst.Write(requestData[:dataLength])
+				if err != nil {
+					log.Printf("err: %v\n", err)
+					return
+				}
 
-				go func() {
-					defer wg.Done()
-					_, err := dst.Write(requestData[:dataLength])
-					if err != nil {
-						log.Printf("err: %v\n", err)
-					}
-				}()
+				response := make([]byte, 512)
+				n, err := dst.Read(response)
+				if err != nil {
+					log.Printf("err: %v\n", err)
+					return
+				}
 
-				go func() {
-					defer wg.Done()
-					_, err := io.Copy(src, dst)
-					if err != nil {
-						log.Printf("err: %v\n", err)
-					}
-				}()
-
-				wg.Wait()
+				src.Write(response[:n])
 			}
 		}()
 	}

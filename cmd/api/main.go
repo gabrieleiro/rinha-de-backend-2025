@@ -242,7 +242,7 @@ func paymentsSummary(ctx *fasthttp.RequestCtx) {
 	}
 }`, int(defaultRequests), defaultAmount, int(fallbackRequests), fallbackAmount)
 
-	ctx.WriteString(j)
+	ctx.Success("application/json", []byte(j))
 }
 
 func requestHandler(ctx *fasthttp.RequestCtx) {
@@ -286,6 +286,13 @@ func main() {
 	}
 	defer udpClient.QueueConn.Close()
 
+	s := &fasthttp.Server{
+		Handler:     requestHandler,
+		IdleTimeout: 5 * time.Minute,
+	}
+
 	log.Printf("listening on port %v\n", serverAddress)
-	fasthttp.ListenAndServe(serverAddress, requestHandler)
+	if err = s.ListenAndServe(serverAddress); err != nil {
+		log.Printf("fasthttp listen and serve error: %v\n", err)
+	}
 }
