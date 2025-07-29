@@ -2,7 +2,7 @@ FROM golang:1.24
 
 WORKDIR /usr/src/tracker
 
-COPY main.go ./
+COPY cmd/tracker/main.go ./
 
 EXPOSE 1111/udp
 

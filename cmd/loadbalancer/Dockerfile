@@ -2,7 +2,7 @@ FROM golang:1.24
 
 WORKDIR /usr/src/loadbalancer
 
-COPY main.go ./
+COPY cmd/loadbalancer/main.go ./
 
 EXPOSE 9999
 

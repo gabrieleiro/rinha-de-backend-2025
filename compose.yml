@@ -8,14 +8,13 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.5"
+          cpus: "0.2"
           memory: "50MB"
     ports:
       - "8888:80"
     environment:
       ADDRESS: ":8888"
-      DEFAULT_PROCESSOR_URL: "http://payment-processor-default:8080"
-      FALLBACK_PROCESSOR_URL: "http://payment-processor-fallback:8080"
+      PAYMENT_QUEUE_URL: "paymentq:2222"
       TRACKER_URL: "tracker:1111"
       PORT: "80"
 
@@ -28,12 +27,33 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.5"
+          cpus: "0.2"
           memory: "50MB"
     ports:
       - "7777:80"
     environment:
       ADDRESS: ":7777"
+      PAYMENT_QUEUE_URL: "paymentq:2222"
+      TRACKER_URL: "tracker:1111"
+      PORT: "80"
+
+  paymentq:
+    hostname: paymentq
+    image: gabrieleiro/rinha-de-backend-2025-paymentq
+    networks:
+      - payment-processor
+      - rinha-de-backend-2025
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "100MB"
+    ports:
+      - "2222:2222/udp"
+    expose:
+      - "2222/udp"
+    environment:
+      ADDRESS: ":2222"
       DEFAULT_PROCESSOR_URL: "http://payment-processor-default:8080"
       FALLBACK_PROCESSOR_URL: "http://payment-processor-fallback:8080"
       TRACKER_URL: "tracker:1111"
@@ -46,7 +66,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.3"
+          cpus: "0.5"
           memory: "50MB"
     ports:
       - "9999:9999"
@@ -62,7 +82,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.2"
+          cpus: "0.1"
           memory: "50MB"
     expose:
       - "1111/udp"

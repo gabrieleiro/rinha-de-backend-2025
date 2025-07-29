@@ -10,7 +10,7 @@ import (
 	"strings"
 )
 
-const MAX_CONNECTIONS_PER_SERVER = 200
+const MAX_CONNECTIONS_PER_SERVER = 500
 
 var SERVERS = []ServerInfo{}
 
@@ -105,6 +105,8 @@ func main() {
 				if err != nil {
 					log.Printf("writing response: %v\n", err)
 				}
+
+				src.Close()
 
 				_, err = dst.Write(requestData[:dataLength])
 				if err != nil {

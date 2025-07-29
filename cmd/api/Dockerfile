@@ -2,7 +2,9 @@ FROM golang:1.24
 
 WORKDIR /usr/src/api
 
-COPY main.go ./
+COPY cmd/api/main.go ./
+COPY go.mod ./
+COPY go.sum ./
 
 EXPOSE 8888
 EXPOSE 7777

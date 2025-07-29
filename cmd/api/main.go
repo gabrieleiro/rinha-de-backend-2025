@@ -19,13 +19,6 @@ import (
 
 var AMOUNT float64 = 0
 
-const MAX_SIZE_OF_TCP_PACKET = 65535
-const TCP_CONNECTION_POOL_SIZE = 200
-
-const HTTP_OK = "HTTP/1.1 200 OK\r\n\r\n"
-const HTTP_INTERNAL_SERVER_ERROR = "HTTP/1.1 500 Internal Server Error\r\n"
-const HTTP_NOT_FOUND = "HTTP/1.1 404 Not Found\r\n\r\n"
-
 var TRACKER_URL = os.Getenv("TRACKER_URL")
 var PAYMENTS_SUMMARY_ENDPOINT = TRACKER_URL + "/summary"
 var TRACK_PAYMENTS_ENDPOINT = TRACKER_URL + "/track"
@@ -50,16 +43,6 @@ type PaymentRequest struct {
 	RequestedAt   string  `json:"requestedAt"`
 }
 
-type CombinedPaymentsSummary struct {
-	Default  PaymentsSummary `json:"default"`
-	Fallback PaymentsSummary `json:"fallback"`
-}
-
-type PaymentsSummary struct {
-	TotalRequests int     `json:"totalRequests"`
-	TotalAmount   float64 `json:"totalAmount"`
-}
-
 func (pr PaymentRequest) String() string {
 	return fmt.Sprintf("%s\n%d", pr.CorrelationID, pr.Amount)
 }
@@ -70,12 +53,6 @@ var retriesChan chan PaymentRequest = make(chan PaymentRequest, 1000)
 type Request struct {
 	w http.ResponseWriter
 	r *http.Request
-}
-
-type TrackRequest struct {
-	Processor string  `json:"processor"`
-	Amount    float64 `json:"amount"`
-	Time      string  `json:"time"`
 }
 
 func parseJson(buffer []byte) (string, float64, error) {
@@ -288,7 +265,7 @@ func main() {
 
 	s := &fasthttp.Server{
 		Handler:     requestHandler,
-		IdleTimeout: 5 * time.Minute,
+		IdleTimeout: 10 * time.Minute,
 	}
 
 	log.Printf("listening on port %v\n", serverAddress)
