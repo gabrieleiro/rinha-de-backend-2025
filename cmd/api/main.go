@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -12,12 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
-
-	"github.com/valyala/fasthttp"
 )
-
-var AMOUNT float64 = 0
 
 var TRACKER_URL = os.Getenv("TRACKER_URL")
 var PAYMENTS_SUMMARY_ENDPOINT = TRACKER_URL + "/summary"
@@ -35,6 +29,10 @@ var client http.Client = http.Client{
 var udpClient struct {
 	QueueConn   *net.UDPConn
 	TrackerConn *net.UDPConn
+}
+
+var udpServer struct {
+	Conn *net.UDPConn
 }
 
 type PaymentRequest struct {
@@ -55,180 +53,29 @@ type Request struct {
 	r *http.Request
 }
 
-func parseJson(buffer []byte) (string, float64, error) {
-	amount := AMOUNT
-	var correlationId string
-
-	for i := 0; i < len(buffer); i++ {
-		c := rune(buffer[i])
-		for c == ' ' || c == '\n' || c == '\t' {
-			i++
-			c = rune(buffer[i])
-		}
-
-		if c != '"' {
-			continue
-		}
-
-		i++
-		c = rune(buffer[i])
-
-		if c == 'c' { // correlationId
-			for c != ':' {
-				i++
-				c = rune(buffer[i])
-			}
-
-			for c != '"' {
-				i++
-				c = rune(buffer[i])
-			}
-
-			i++ // skip opening "
-			c = rune(buffer[i])
-
-			stringStart := i
-
-			for c != '"' {
-				i++
-				c = rune(buffer[i])
-			}
-
-			correlationId = string(buffer[stringStart:i])
-		} else if c == 'a' { // amount
-			if amount != 0 {
-				break
-			}
-
-			for c != ':' {
-				i++
-				c = rune(buffer[i])
-			}
-
-			for !unicode.IsDigit(c) {
-				i++
-				c = rune(buffer[i])
-			}
-
-			numberStart := i
-
-			for unicode.IsDigit(c) {
-				i++
-				c = rune(buffer[i])
-			}
-
-			if c == '.' {
-				i++
-				c = rune(buffer[i])
-			}
-
-			for unicode.IsDigit(c) {
-				i++
-				c = rune(buffer[i])
-			}
-
-			var err error
-			amount, err = strconv.ParseFloat(string(buffer[numberStart:i]), 64)
-			if err != nil {
-				return correlationId, amount, errors.New("parsing float")
-			}
-		}
-	}
-
-	return correlationId, amount, nil
-}
-
-func payments(ctx *fasthttp.RequestCtx) {
-	correlationId, amount, err := parseJson(ctx.PostBody())
+func payments(correlationId string, amount float64) {
+	message := fmt.Sprintf("%s;%f\n", correlationId, amount)
+	_, err := udpClient.QueueConn.Write([]byte(message))
 	if err != nil {
-		ctx.SetStatusCode(500)
+		log.Printf("sending message to payment queue: %v\n", err)
 		return
 	}
-
-	go func() {
-		message := fmt.Sprintf("%s;%f\n", correlationId, amount)
-		_, err := udpClient.QueueConn.Write([]byte(message))
-		if err != nil {
-			log.Printf("sending message to payment queue: %v\n", err)
-			return
-		}
-	}()
-
-	ctx.SetStatusCode(200)
 }
 
-func paymentsSummary(ctx *fasthttp.RequestCtx) {
-	from := ctx.URI().QueryArgs().PeekBytes([]byte("from"))
-	to := ctx.URI().QueryArgs().PeekBytes([]byte("to"))
-
-	message := fmt.Sprintf("s%s;%s\n", string(from), string(to))
-
-	_, err := udpClient.TrackerConn.Write([]byte(message))
+func paymentsSummary(addr *net.UDPAddr, payload []byte) {
+	_, err := udpClient.TrackerConn.Write(append(payload, '\n'))
 	if err != nil {
 		log.Printf("sending message to tracker: %v\n", err)
-		ctx.SetStatusCode(500)
 		return
 	}
 
-	trackerResponse, err := bufio.NewReader(udpClient.TrackerConn).ReadString('\n')
+	trackerResponse, err := bufio.NewReader(udpClient.TrackerConn).ReadBytes('\n')
 	if err != nil {
 		log.Printf("reading from tracker: %v\n", err)
-
-		ctx.SetStatusCode(500)
 		return
 	}
 
-	data := strings.Split(trackerResponse[:len(trackerResponse)-1], ";")
-	defaultRequests, err := strconv.ParseInt(data[0], 10, 64)
-	if err != nil {
-		log.Printf("parsing integer: %v\n", err)
-		ctx.SetStatusCode(500)
-		return
-	}
-	defaultAmount, err := strconv.ParseFloat(data[1], 64)
-	if err != nil {
-		log.Printf("parsing float: %v\n", err)
-
-		ctx.SetStatusCode(500)
-		return
-	}
-
-	fallbackRequests, err := strconv.ParseInt(data[2], 10, 64)
-	if err != nil {
-		log.Printf("parsing integer: %v\n", err)
-
-		ctx.SetStatusCode(500)
-		return
-	}
-	fallbackAmount, err := strconv.ParseFloat(data[3], 64)
-	if err != nil {
-		log.Printf("parsing float: %v\n", err)
-
-		ctx.SetStatusCode(500)
-		return
-	}
-
-	j := fmt.Sprintf(`{
-	"default": {
-		"totalRequests": %d,
-		"totalAmount": %f
-	},
-	"fallback": {
-		"totalRequests": %d,
-		"totalAmount": %f
-	}
-}`, int(defaultRequests), defaultAmount, int(fallbackRequests), fallbackAmount)
-
-	ctx.Success("application/json", []byte(j))
-}
-
-func requestHandler(ctx *fasthttp.RequestCtx) {
-	switch string(ctx.Path()) {
-	case "/payments":
-		payments(ctx)
-	case "/payments-summary":
-		paymentsSummary(ctx)
-	}
+	udpServer.Conn.WriteToUDP(trackerResponse, addr)
 }
 
 func dialUDP(addressString string) (*net.UDPConn, error) {
@@ -263,13 +110,42 @@ func main() {
 	}
 	defer udpClient.QueueConn.Close()
 
-	s := &fasthttp.Server{
-		Handler:     requestHandler,
-		IdleTimeout: 10 * time.Minute,
+	udpAddr, err := net.ResolveUDPAddr("udp", serverAddress)
+	if err != nil {
+		log.Printf("resolving address: %v\n", err)
+		return
 	}
 
-	log.Printf("listening on port %v\n", serverAddress)
-	if err = s.ListenAndServe(serverAddress); err != nil {
-		log.Printf("fasthttp listen and serve error: %v\n", err)
+	udpServer.Conn, err = net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		log.Printf("listening on UDP port: %v\n", err)
+		return
+	}
+
+	for {
+		var buf [512]byte
+
+		n, addr, err := udpServer.Conn.ReadFromUDP(buf[0:])
+		if err != nil {
+			log.Printf("reading from connection: %v\n", err)
+			continue
+		}
+
+		go func() {
+			data := buf[:n-1]
+
+			if data[0] == 0 { // POST
+				params := strings.Split(string(data[1:]), ";")
+				amount, err := strconv.ParseFloat(params[1], 64)
+				if err != nil {
+					log.Printf("parsing float: %v\n", err)
+					return
+				}
+
+				payments(params[0], amount)
+			} else { // GET
+				paymentsSummary(addr, data)
+			}
+		}()
 	}
 }

@@ -75,7 +75,7 @@ func (t *Tracker) Track(tr TrackRequest) {
 
 var tracker Tracker
 
-func (t *Tracker) RangedSummary(from, to *time.Time) CombinedPaymentsSummary {
+func (t *Tracker) RangedSummary(from, to *time.Time) string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -116,16 +116,10 @@ func (t *Tracker) RangedSummary(from, to *time.Time) CombinedPaymentsSummary {
 		}
 	}
 
-	return CombinedPaymentsSummary{
-		Default: PaymentsSummary{
-			TotalAmount:   amountDefault,
-			TotalRequests: requestsDefault,
-		},
-		Fallback: PaymentsSummary{
-			TotalAmount:   amountFallback,
-			TotalRequests: requestsFallback,
-		},
-	}
+	json := fmt.Sprintf(`{ "default": { "totalRequests": %d, "totalAmount": %f }, "fallback": { "totalRequests": %d, "totalAmount": %f } }%s`,
+		requestsDefault, amountDefault, requestsFallback, amountFallback, "\n")
+
+	return json
 }
 
 func main() {
@@ -155,7 +149,7 @@ func main() {
 		go func() {
 			data := buf[:n-1]
 
-			if string(data[0]) == "t" {
+			if data[0] == 0 {
 				params := strings.Split(string(data[1:]), ";")
 				amount, err := strconv.ParseFloat(params[1], 64)
 				if err != nil {
@@ -168,7 +162,7 @@ func main() {
 					Amount:    amount,
 					Time:      params[2],
 				})
-			} else if string(data[0]) == "s" {
+			} else if data[0] == 1 {
 				params := strings.Split(string(data[1:]), ";")
 				var from, to *time.Time
 
@@ -182,7 +176,7 @@ func main() {
 					from = &t
 				}
 
-				if params[1] != "" {
+				if len(params) > 1 && params[1] != "" {
 					t, err := time.Parse(time.RFC3339Nano, params[1])
 					if err != nil {
 						log.Printf("parsing to timestamp %v\n", err)
@@ -193,8 +187,7 @@ func main() {
 				}
 
 				summary := tracker.RangedSummary(from, to)
-				response := fmt.Sprintf("%d;%f;%d;%f\n", summary.Default.TotalRequests, summary.Default.TotalAmount, summary.Fallback.TotalRequests, summary.Fallback.TotalAmount)
-				client.Conn.WriteToUDP([]byte(response), addr)
+				client.Conn.WriteToUDP([]byte(summary), addr)
 			} else {
 				log.Printf("unrecognized message: %v\n", string(buf[0:]))
 			}

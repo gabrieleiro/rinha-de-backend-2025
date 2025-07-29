@@ -112,9 +112,10 @@ func tryPay(endpoint string, pr PaymentRequest) error {
 }
 
 func trackPayment(pr PaymentRequest, processor string) {
-	message := fmt.Sprintf("t%s;%f;%s\n", processor, pr.Amount, pr.RequestedAt)
-
-	_, err := udpClient.TrackerConn.Write([]byte(message))
+	var message strings.Builder
+	message.WriteByte(0)
+	message.WriteString(fmt.Sprintf("%s;%f;%s\n", processor, pr.Amount, pr.RequestedAt))
+	_, err := udpClient.TrackerConn.Write([]byte(message.String()))
 	if err != nil {
 		log.Printf("sending message to tracker: %v\n", err)
 		return
