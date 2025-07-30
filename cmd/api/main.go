@@ -276,6 +276,8 @@ func main() {
 		}()
 	}
 
+	fmt.Println("up and running")
+
 	// listen to messages from load balancer
 	for {
 		var buf [512]byte

@@ -160,6 +160,8 @@ func main() {
 		return
 	}
 
+	fmt.Println("up and running")
+
 	for {
 		src, err := listener.Accept()
 		if err != nil {

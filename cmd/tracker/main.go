@@ -132,6 +132,8 @@ func main() {
 		return
 	}
 
+	fmt.Println("up and running")
+
 	for {
 		var buf [512]byte
 
