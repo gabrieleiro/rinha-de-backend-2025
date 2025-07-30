@@ -1,63 +1,38 @@
-services:
-  api-1:
-    hostname: api-1
+x-service-templates:
+  api: &api
     image: gabrieleiro/rinha-de-backend-2025-api
     networks:
       - rinha-de-backend-2025
       - payment-processor
-    deploy:
-      resources:
-        limits:
-          cpus: "0.2"
-          memory: "50MB"
-    ports:
-      - "8888:80"
-    environment:
-      ADDRESS: ":8888"
-      PAYMENT_QUEUE_URL: "paymentq:2222"
-      TRACKER_URL: "tracker:1111"
-      PORT: "80"
-
-  api-2:
-    hostname: api-2
-    image: gabrieleiro/rinha-de-backend-2025-api
-    networks:
-      - payment-processor
-      - rinha-de-backend-2025
-    deploy:
-      resources:
-        limits:
-          cpus: "0.2"
-          memory: "50MB"
-    ports:
-      - "7777:80"
-    environment:
-      ADDRESS: ":7777"
-      PAYMENT_QUEUE_URL: "paymentq:2222"
-      TRACKER_URL: "tracker:1111"
-      PORT: "80"
-
-  paymentq:
-    hostname: paymentq
-    image: gabrieleiro/rinha-de-backend-2025-paymentq
-    networks:
-      - payment-processor
-      - rinha-de-backend-2025
     deploy:
       resources:
         limits:
           cpus: "0.5"
           memory: "100MB"
-    ports:
-      - "2222:2222/udp"
-    expose:
-      - "2222/udp"
+    depends_on:
+      - tracker
     environment:
-      ADDRESS: ":2222"
       DEFAULT_PROCESSOR_URL: "http://payment-processor-default:8080"
       FALLBACK_PROCESSOR_URL: "http://payment-processor-fallback:8080"
       TRACKER_URL: "tracker:1111"
       PORT: "80"
+
+services:
+  api-1: 
+    <<: *api
+    hostname: api-1
+    ports:
+      - "8888:80"
+    environment:
+      ADDRESS: ":8888"
+
+  api-2:
+    <<: *api
+    hostname: api-2
+    ports:
+      - "7777:80"
+    environment:
+      ADDRESS: ":7777"
 
   load-balancer:
     image: gabrieleiro/rinha-de-backend-2025-load-balancer
@@ -66,13 +41,16 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.5"
+          cpus: "0.4"
           memory: "50MB"
     ports:
       - "9999:9999"
     environment:
       ADDRESS: ":9999"
       SERVERS: "api-1:8888,api-2:7777"
+    depends_on:
+      - api-1
+      - api-2
 
   tracker:
     hostname: tracker
