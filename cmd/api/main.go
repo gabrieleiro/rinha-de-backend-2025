@@ -2,6 +2,9 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -10,8 +13,17 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
+
+var DEFAULT_PROCESSOR_URL = os.Getenv("DEFAULT_PROCESSOR_URL")
+var DEFAULT_PAYMENTS_ENDPOINT = DEFAULT_PROCESSOR_URL + "/payments"
+var DEFAULT_SERVICE_HEALTH_ENDPOINT = DEFAULT_PROCESSOR_URL + "/payments/service-health"
+
+var FALLBACK_PROCESSOR_URL = os.Getenv("FALLBACK_PROCESSOR_URL")
+var FALLBACK_PAYMENTS_ENDPOINT = FALLBACK_PROCESSOR_URL + "/payments"
+var FALLBACK_SERVICE_HEALTH_ENDPOINT = FALLBACK_PROCESSOR_URL + "/payments/service-health"
 
 var TRACKER_URL = os.Getenv("TRACKER_URL")
 var PAYMENTS_SUMMARY_ENDPOINT = TRACKER_URL + "/summary"
@@ -21,6 +33,9 @@ var PAYMENT_QUEUE_URL = os.Getenv("PAYMENT_QUEUE_URL")
 
 const HEALTH_CHECKER_INTERVAL = 6 * time.Second
 const MAX_TIMEOUT_IN_MS = 200
+
+var paymentsQueue chan PaymentRequest = make(chan PaymentRequest, 10_000)
+var retriesQueue chan PaymentRequest = make(chan PaymentRequest, 1000)
 
 var client http.Client = http.Client{
 	Timeout: 200 * time.Millisecond,
@@ -35,31 +50,134 @@ var udpServer struct {
 	Conn *net.UDPConn
 }
 
+var httpClient http.Client = http.Client{
+	Timeout: 2000 * time.Millisecond,
+}
+
 type PaymentRequest struct {
-	CorrelationID string  `json:"correlationId"`
 	Amount        float64 `json:"amount"`
+	CorrelationID string  `json:"correlationId"`
 	RequestedAt   string  `json:"requestedAt"`
 }
 
-func (pr PaymentRequest) String() string {
-	return fmt.Sprintf("%s\n%d", pr.CorrelationID, pr.Amount)
+type ServiceHealth struct {
+	Failing         bool `json:"failing"`
+	MinResponseTime int  `json:"minResponseTime"`
 }
 
-var paymentWorkerChan chan PaymentRequest = make(chan PaymentRequest, 10_000)
-var retriesChan chan PaymentRequest = make(chan PaymentRequest, 1000)
+type HealthChecker struct {
+	Default  ServiceHealth
+	Fallback ServiceHealth
+}
+
+func (hc *HealthChecker) check() {
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		resp, err := http.Get(DEFAULT_SERVICE_HEALTH_ENDPOINT)
+		if err != nil {
+			log.Printf("checking default's health: %v\n", err)
+		}
+
+		if resp != nil {
+			defer resp.Body.Close()
+		}
+
+		json.NewDecoder(resp.Body).Decode(&hc.Default)
+	}()
+
+	go func() {
+		defer wg.Done()
+		resp, err := http.Get(FALLBACK_SERVICE_HEALTH_ENDPOINT)
+		if err != nil {
+			log.Printf("checking fallback's health: %v\n", err)
+			return
+		}
+
+		if resp != nil {
+			defer resp.Body.Close()
+		}
+
+		json.NewDecoder(resp.Body).Decode(&hc.Fallback)
+	}()
+
+	wg.Wait()
+}
+
+var healthChecker HealthChecker
+
+func tryPay(endpoint string, pr PaymentRequest) error {
+	payload, err := json.Marshal(pr)
+	if err != nil {
+		log.Printf("encoding json: %v\n", err)
+		return err
+	}
+
+	response, err := httpClient.Post(endpoint, "application/json", bytes.NewBuffer(payload))
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		return errors.New(response.Status)
+	}
+
+	return nil
+}
+
+func tryProcessing(pr PaymentRequest) error {
+	if healthChecker.Default.Failing && healthChecker.Fallback.Failing {
+		return errors.New("both processors are down")
+	}
+
+	if healthChecker.Default.MinResponseTime > MAX_TIMEOUT_IN_MS && healthChecker.Fallback.MinResponseTime > MAX_TIMEOUT_IN_MS {
+		return errors.New("both processors are slow")
+	}
+
+	if !healthChecker.Default.Failing && healthChecker.Default.MinResponseTime < MAX_TIMEOUT_IN_MS {
+		now := time.Now().UTC()
+		pr.RequestedAt = now.UTC().Format(time.RFC3339Nano)
+		err := tryPay(DEFAULT_PAYMENTS_ENDPOINT, pr)
+
+		if err == nil {
+			trackPayment(pr, "default")
+			return nil
+		}
+	}
+
+	if !healthChecker.Fallback.Failing && healthChecker.Default.MinResponseTime < MAX_TIMEOUT_IN_MS {
+		now := time.Now().UTC()
+		pr.RequestedAt = now.UTC().Format(time.RFC3339Nano)
+		err := tryPay(FALLBACK_PAYMENTS_ENDPOINT, pr)
+
+		if err == nil {
+			trackPayment(pr, "fallback")
+			return nil
+		} else {
+			return err
+		}
+	}
+
+	return errors.New("undefined error")
+}
+
+func trackPayment(pr PaymentRequest, processor string) {
+	var message strings.Builder
+	message.WriteByte(0)
+	message.WriteString(fmt.Sprintf("%s;%f;%s\n", processor, pr.Amount, pr.RequestedAt))
+	_, err := udpClient.TrackerConn.Write([]byte(message.String()))
+	if err != nil {
+		log.Printf("sending message to tracker: %v\n", err)
+		return
+	}
+}
 
 type Request struct {
 	w http.ResponseWriter
 	r *http.Request
-}
-
-func payments(correlationId string, amount float64) {
-	message := fmt.Sprintf("%s;%f\n", correlationId, amount)
-	_, err := udpClient.QueueConn.Write([]byte(message))
-	if err != nil {
-		log.Printf("sending message to payment queue: %v\n", err)
-		return
-	}
 }
 
 func paymentsSummary(addr *net.UDPAddr, payload []byte) {
@@ -95,6 +213,7 @@ func dialUDP(addressString string) (*net.UDPConn, error) {
 func main() {
 	serverAddress := os.Getenv("ADDRESS")
 
+	// networking
 	var err error
 	udpClient.TrackerConn, err = dialUDP(TRACKER_URL)
 	if err != nil {
@@ -102,13 +221,6 @@ func main() {
 		return
 	}
 	defer udpClient.TrackerConn.Close()
-
-	udpClient.QueueConn, err = dialUDP(PAYMENT_QUEUE_URL)
-	if err != nil {
-		log.Printf("initing udp client: %v\n", err)
-		return
-	}
-	defer udpClient.QueueConn.Close()
 
 	udpAddr, err := net.ResolveUDPAddr("udp", serverAddress)
 	if err != nil {
@@ -122,10 +234,36 @@ func main() {
 		return
 	}
 
+	// init queues
+	for i := 0; i < 1000; i++ {
+		go func() {
+			for pr := range paymentsQueue {
+				err := tryProcessing(pr)
+
+				if err != nil {
+					retriesQueue <- pr
+				}
+			}
+		}()
+	}
+
+	for i := 0; i < 100; i++ {
+		go func() {
+			for pr := range retriesQueue {
+				err := tryProcessing(pr)
+
+				if err != nil {
+					retriesQueue <- pr
+				}
+			}
+		}()
+	}
+
+	// listen to messages from load balancer
 	for {
 		var buf [512]byte
 
-		n, addr, err := udpServer.Conn.ReadFromUDP(buf[0:])
+		n, addr, err := udpServer.Conn.ReadFromUDP(buf[:])
 		if err != nil {
 			log.Printf("reading from connection: %v\n", err)
 			continue
@@ -142,7 +280,7 @@ func main() {
 					return
 				}
 
-				payments(params[0], amount)
+				paymentsQueue <- PaymentRequest{amount, params[0], ""}
 			} else { // GET
 				paymentsSummary(addr, data)
 			}
