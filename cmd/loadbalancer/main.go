@@ -19,9 +19,12 @@ var AMOUNT []byte
 var HTTP_200_OK_RETURN = []byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
 var BODY_SEPARATOR = []byte("\r\n\r\n")
 var POST = []byte("POST")
+var POST_PAYMENTS = []byte("POST /payments HTTP/1.1\r\n")
+var GET_SUMMARY = []byte("GET /payments-summary")
 
 var HTTP_200_OK = []byte("HTTP/1.1 200 OK\r\n")
 var HTTP_500_Internal_Server_Error = []byte("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n")
+var HTTP_404_NOT_FOUND = []byte("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n")
 
 var SERVERS = []ServerInfo{}
 
@@ -134,7 +137,16 @@ func bodyFrom(request []byte) []byte {
 
 func main() {
 	serverAddresses := strings.Split(os.Getenv("SERVERS"), ",")
+
+	if len(serverAddresses) < 1 {
+		log.Printf("no server addresses specified\n")
+		return
+	}
+
 	address := os.Getenv("ADDRESS")
+	if address == "" {
+		address = ":9999"
+	}
 
 	// set up connection to servers
 	for _, sa := range serverAddresses {
@@ -181,7 +193,7 @@ func main() {
 
 			s := pickServer()
 
-			if bytes.Equal(requestData[:4], POST) {
+			if bytes.Equal(requestData[:len(POST_PAYMENTS)], POST_PAYMENTS) {
 				// POST doesn't return anything
 				// and is processed assynchronously
 				// so we just return early
@@ -226,7 +238,7 @@ func main() {
 					log.Printf("redirecting POST data: %v\n", err)
 					return
 				}
-			} else {
+			} else if bytes.Equal(requestData[:len(GET_SUMMARY)], GET_SUMMARY) {
 				// This branch is severely less
 				// optimized than the previous one.
 				// The GET endpoint isn't
@@ -317,6 +329,8 @@ func main() {
 				response.Write(backendResponse)
 
 				src.Write(response.Bytes())
+			} else {
+				src.Write(HTTP_404_NOT_FOUND)
 			}
 		}()
 	}
