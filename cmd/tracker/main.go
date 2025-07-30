@@ -33,11 +33,6 @@ type StatsTracker struct {
 	mu                      sync.Mutex
 }
 
-type CombinedPaymentsSummary struct {
-	Default  PaymentsSummary `json:"default"`
-	Fallback PaymentsSummary `json:"fallback"`
-}
-
 type TrackRequest struct {
 	Processor string  `json:"processor"`
 	Amount    float64 `json:"amount"`
@@ -149,6 +144,20 @@ func main() {
 		go func() {
 			data := buf[:n-1]
 
+			// The first byte of the payload
+			// indicates whether it's trying
+			// to track a payment that has
+			// been processed or get a summary
+			// of payments tracked so far
+			// 0x0 = track payment
+			// 0x1 = get summary
+
+			// The payload format for tracking
+			// new payments looks like this:
+			// <0x1><default | fallback>;<correlationId>;<amount>\n
+			//
+			// And for retrieving the summary:
+			// 0x1<from>;<to>\n
 			if data[0] == 0 {
 				params := strings.Split(string(data[1:]), ";")
 				amount, err := strconv.ParseFloat(params[1], 64)
