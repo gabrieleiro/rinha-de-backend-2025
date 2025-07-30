@@ -197,6 +197,11 @@ func main() {
 					return
 				}
 
+				if len(correlationId) == 0 || len(amount) == 0 {
+					log.Printf("post body missing fields\n")
+					return
+				}
+
 				// Formatting payload to send to backend server
 				// The payload format is this:
 				// <one byte>correlationId;amount\n

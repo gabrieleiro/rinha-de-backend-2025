@@ -122,6 +122,23 @@ func tryPay(endpoint string, pr PaymentRequest) error {
 	defer response.Body.Close()
 
 	if response.StatusCode != http.StatusOK {
+		// If the error is not on their end,
+		// we just give up on processing the
+		// request. The two most probable
+		// causes are:
+		// 1. This correlationId has already been processed
+		// 2. We made a mistake when building the payload
+		//
+		// There are clever ways to handle
+		// these cases, like having a reconciliation
+		// function that tracks already
+		// processsed payments. I don't
+		// have any more time to spend
+		// on this project though :/
+		if response.StatusCode != http.StatusInternalServerError {
+			return nil
+		}
+
 		return errors.New(response.Status)
 	}
 
@@ -274,6 +291,11 @@ func main() {
 
 			if data[0] == 0 { // POST
 				params := strings.Split(string(data[1:]), ";")
+				if len(params) != 2 || params[0] == "" || params[1] == "" {
+					log.Printf("malformed message: %v\n", string(data[1:]))
+					return
+				}
+
 				amount, err := strconv.ParseFloat(params[1], 64)
 				if err != nil {
 					log.Printf("parsing float: %v\n", err)
