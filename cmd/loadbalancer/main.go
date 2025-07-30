@@ -5,8 +5,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"sync"
-	"time"
 	"unicode"
 
 	"log"
@@ -22,8 +20,8 @@ var HTTP_200_OK_RETURN = []byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
 var BODY_SEPARATOR = []byte("\r\n\r\n")
 var POST = []byte("POST")
 
-const HTTP_200_OK = "HTTP/1.1 200 OK\r\n"
-const HTTP_500_Internal_Server_Error = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n"
+var HTTP_200_OK = []byte("HTTP/1.1 200 OK\r\n")
+var HTTP_500_Internal_Server_Error = []byte("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n")
 
 var SERVERS = []ServerInfo{}
 
@@ -33,84 +31,87 @@ type ServerInfo struct {
 }
 
 func pickServer() *ServerInfo {
+	// I mean... it's just two servers anyway
 	return &SERVERS[rand.Intn(len(SERVERS))]
 }
 
+// zero-allocation json parser
+// only parses "correlationId" and "amount" fields
 func parseJson(buffer []byte) ([]byte, []byte, error) {
 	amount := AMOUNT
 	var correlationId []byte
+	var c byte
+	var pos int
 
-	for i := 0; i < len(buffer); i++ {
-		c := rune(buffer[i])
+	advance := func() {
+		pos++
+		c = buffer[pos]
+	}
+
+	for pos = 0; pos < len(buffer); pos++ {
+		c = buffer[pos]
+
 		for c == ' ' || c == '\n' || c == '\t' {
-			i++
-			c = rune(buffer[i])
+			advance()
 		}
 
 		if c != '"' {
 			continue
 		}
 
-		i++
-		c = rune(buffer[i])
+		advance()
 
 		if c == 'c' { // correlationId
 			for c != ':' {
-				i++
-				c = rune(buffer[i])
+				advance()
 			}
 
 			for c != '"' {
-				i++
-				c = rune(buffer[i])
+				advance()
 			}
 
-			i++ // skip opening "
-			c = rune(buffer[i])
+			advance() // skip opening "
 
-			stringStart := i
+			stringStart := pos
 
 			for c != '"' {
-				i++
-				c = rune(buffer[i])
+				advance()
 			}
 
-			correlationId = buffer[stringStart:i]
+			correlationId = buffer[stringStart:pos]
 		} else if c == 'a' { // amount
+			// amount is always the same in all requests
+			// so if we only parse the first occurance
+			// and reuse that
 			if amount != nil {
 				break
 			}
 
 			for c != ':' {
-				i++
-				c = rune(buffer[i])
+				advance()
 			}
 
-			for !unicode.IsDigit(c) {
-				i++
-				c = rune(buffer[i])
+			for !unicode.IsDigit(rune(c)) {
+				advance()
 			}
 
-			numberStart := i
+			numberStart := pos
 
-			for unicode.IsDigit(c) {
-				i++
-				c = rune(buffer[i])
+			for unicode.IsDigit(rune(c)) {
+				advance()
 			}
 
 			if c == '.' {
-				i++
-				c = rune(buffer[i])
+				advance()
 			}
 
-			for unicode.IsDigit(c) {
-				i++
-				c = rune(buffer[i])
+			for unicode.IsDigit(rune(c)) {
+				advance()
 			}
 
 			var err error
-			amount = buffer[numberStart:i]
-			AMOUNT = buffer[numberStart:i]
+			amount = buffer[numberStart:pos]
+			AMOUNT = buffer[numberStart:pos]
 
 			if err != nil {
 				return correlationId, amount, errors.New("parsing float")
@@ -119,22 +120,6 @@ func parseJson(buffer []byte) ([]byte, []byte, error) {
 	}
 
 	return correlationId, amount, nil
-}
-
-type Timings struct {
-	name    string
-	slowest time.Duration
-	mu      sync.Mutex
-}
-
-func (t *Timings) Add(d time.Duration) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	if d > t.slowest {
-		log.Printf("new slowest for %s: %v\n", t.name, d)
-		t.slowest = d
-	}
 }
 
 func bodyFrom(request []byte) []byte {
@@ -151,9 +136,7 @@ func main() {
 	serverAddresses := strings.Split(os.Getenv("SERVERS"), ",")
 	address := os.Getenv("ADDRESS")
 
-	postTimings := Timings{name: "post"}
-	getTimings := Timings{name: "get"}
-
+	// set up connection to servers
 	for _, sa := range serverAddresses {
 		si := ServerInfo{Address: sa}
 		udpAddr, err := net.ResolveUDPAddr("udp", sa)
@@ -185,7 +168,6 @@ func main() {
 		}
 
 		go func() {
-			start := time.Now()
 			defer src.Close()
 
 			requestData := make([]byte, 512)
@@ -198,6 +180,9 @@ func main() {
 			s := pickServer()
 
 			if bytes.Equal(requestData[:4], POST) {
+				// POST doesn't return anything
+				// and is processed assynchronously
+				// so we just return early
 				_, err = src.Write(HTTP_200_OK_RETURN)
 				if err != nil {
 					log.Printf("writing response: %v\n", err)
@@ -205,7 +190,6 @@ func main() {
 				}
 
 				src.Close()
-				postTimings.Add(time.Since(start))
 
 				correlationId, amount, err := parseJson(bodyFrom(requestData))
 				if err != nil {
@@ -213,9 +197,18 @@ func main() {
 					return
 				}
 
-				messageBuf := make([]byte, 0, len(correlationId)+len(amount)+3)
+				// Formatting payload to send to backend server
+				// The payload format is this:
+				// <one byte>correlationId;amount\n
+				// The first byte indicates whether we're
+				// adding a new payment to be processed or
+				// we want to retrieve a summary of payments
+				// 0x0 = process new payment
+				// 0x1 = get summary
+
+				messageBuf := make([]byte, 0, len(correlationId)+len(amount)+3) // 3 = first byte + ; + \n
 				message := bytes.NewBuffer(messageBuf)
-				message.WriteByte(0)
+				message.WriteByte(uint8(0))
 				message.Write(correlationId)
 				message.WriteByte(';')
 				message.Write(amount)
@@ -227,10 +220,25 @@ func main() {
 					return
 				}
 			} else {
-				// parse url and query args
-				var response strings.Builder
+				// This branch is severely less
+				// optimized than the previous one.
+				// The GET endpoint isn't
+				// supposed to be under heavy
+				// stress, so we allow ourselves
+				// to be less performant here in
+				// order to have code that is easier
+				// to read. We have significantly more
+				// allocations and string operations here
+				// and much less raw byte manipulation.
+
+				var responseBuf []byte
+				response := bytes.NewBuffer(responseBuf)
 
 				lines := strings.Split(string(requestData[:]), "\r\n")
+				// The first line of an HTTP request is formatted as such:
+				// VERB /path/to/resource
+				// In this case:
+				// GET /payments-summary?from=2025-07-29T20:19:32.734Z&to=2025-07-29T20:19:45.690Z
 				path := strings.Split(lines[0], " ")[1]
 
 				var from, to string
@@ -253,16 +261,27 @@ func main() {
 				}
 
 				// formatting request to backend
-				var message strings.Builder
-				message.WriteByte(1)
-				message.WriteString(fmt.Sprintf("%s;%s\n", from, to))
+				// The payload format is this:
+				// <one byte>from;to\n
+				// The first byte indicates whether we're
+				// adding a new payment to be processed or
+				// we want to retrieve a summary of payments
+				// 0x0 = process new payment
+				// 0x1 = get summary
+				messageBuf := make([]byte, 0, len(from)+len(to)+3) // 3 = first byte + ; + \n
+				message := bytes.NewBuffer(messageBuf)
+				message.WriteByte(uint8(1))
+				message.WriteString(from)
+				message.WriteByte(';')
+				message.WriteString(to)
+				message.WriteByte('\n')
 
-				_, err := s.Conn.Write([]byte(message.String()))
+				_, err := s.Conn.Write(message.Bytes())
 				if err != nil {
 					log.Printf("err: %v\n", err)
-					response.WriteString(HTTP_500_Internal_Server_Error)
+					response.Write(HTTP_500_Internal_Server_Error)
 
-					src.Write([]byte(response.String()))
+					src.Write(response.Bytes())
 					return
 				}
 
@@ -270,28 +289,27 @@ func main() {
 				backendResponse, err := bufio.NewReader(s.Conn).ReadBytes('\n')
 				if err != nil {
 					log.Printf("reading from backend server: %v\n", err)
-					response.WriteString(HTTP_500_Internal_Server_Error)
+					response.Write(HTTP_500_Internal_Server_Error)
 
-					src.Write([]byte(response.String()))
+					src.Write(response.Bytes())
 					return
 				}
 
 				if err != nil {
 					log.Printf("parsing summary to json: %v\n", err)
-					response.WriteString(HTTP_500_Internal_Server_Error)
+					response.Write(HTTP_500_Internal_Server_Error)
 
-					src.Write([]byte(response.String()))
+					src.Write(response.Bytes())
 					return
 				}
 
-				response.WriteString(HTTP_200_OK)
+				response.Write(HTTP_200_OK)
 				response.WriteString("Content-Type: application/json\r\n")
 				response.WriteString(fmt.Sprintf("Content-Length: %d\r\n", len(backendResponse)))
 				response.WriteString("\r\n")
-				response.WriteString(string(backendResponse))
+				response.Write(backendResponse)
 
-				src.Write([]byte(response.String()))
-				getTimings.Add(time.Since(start))
+				src.Write(response.Bytes())
 			}
 		}()
 	}
