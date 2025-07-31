@@ -16,15 +16,18 @@ import (
 
 var AMOUNT []byte
 
-var HTTP_200_OK_RETURN = []byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-var BODY_SEPARATOR = []byte("\r\n\r\n")
 var POST = []byte("POST")
-var POST_PAYMENTS = []byte("POST /payments HTTP/1.1\r\n")
-var GET_SUMMARY = []byte("GET /payments-summary")
+var GET = []byte("GET")
 
 var HTTP_200_OK = []byte("HTTP/1.1 200 OK\r\n")
+var HTTP_200_OK_RETURN = []byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
 var HTTP_500_Internal_Server_Error = []byte("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n")
 var HTTP_404_NOT_FOUND = []byte("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n")
+
+var BODY_SEPARATOR = []byte("\r\n\r\n")
+
+var PAYMENTS_ENDPOINT = []byte("/payments")
+var PAYMENTS_SUMMARY_ENDPOINT = []byte("/payments-summary")
 
 var SERVERS = []ServerInfo{}
 
@@ -125,6 +128,89 @@ func parseJson(buffer []byte) ([]byte, []byte, error) {
 	return correlationId, amount, nil
 }
 
+// expects URI encoded query args
+// like ?name=tom&enemy=jerry
+func parseQueryArgs(input []byte) map[string]string {
+	if len(input) == 0 {
+		return nil
+	}
+
+	res := make(map[string]string)
+	pos := 0
+	c := input[pos]
+	var field strings.Builder
+	var value strings.Builder
+	curr := &field
+
+	for pos < len(input) && c != '\r' && c != ' ' {
+		if c == '&' {
+			res[field.String()] = value.String()
+			field.Reset()
+			value.Reset()
+
+			curr = &field
+		} else if c == '=' {
+			curr = &value
+		} else {
+			curr.WriteByte(c)
+		}
+
+		pos++
+
+		if pos < len(input) {
+			c = input[pos]
+		}
+	}
+
+	if value.Len() > 0 {
+		res[field.String()] = value.String()
+	}
+
+	return res
+}
+
+// According to HTTP 1.1 RFC (2616), "Request Line"
+// is the first line of an HTTP request,
+// which is formatted as such:
+// VERB /path/to/resource HTTP/1.1
+//
+// https://www.w3.org/Protocols/rfc2616/rfc2616-sec5.html
+func parseRequestLine(request []byte) (verb []byte, uri []byte, queryArgs map[string]string, err error) {
+	if len(request) == 0 {
+		return
+	}
+
+	pos := 0
+	c := request[pos]
+
+	advance := func() {
+		pos++
+
+		if pos < len(request) {
+			c = request[pos]
+		}
+	}
+
+	for c != ' ' {
+		verb = append(verb, c)
+		advance()
+	}
+
+	advance()
+
+	for pos < len(request) && c != ' ' && c != '?' {
+		uri = append(uri, c)
+		advance()
+	}
+
+	if pos < len(request) && c == '?' {
+		advance()
+		queryArgs = parseQueryArgs(request[pos:])
+	}
+
+	return
+}
+
 func bodyFrom(request []byte) []byte {
 	for i := range request {
 		if request[i] == '\r' && bytes.Equal(request[i:i+4], BODY_SEPARATOR) {
@@ -191,9 +277,15 @@ func main() {
 				return
 			}
 
+			verb, uri, queryArgs, err := parseRequestLine(requestData)
+			if err != nil {
+				log.Printf("parsing request line: %v\n", err)
+				return
+			}
+
 			s := pickServer()
 
-			if bytes.Equal(requestData[:len(POST_PAYMENTS)], POST_PAYMENTS) {
+			if bytes.Equal(verb, POST) && bytes.Equal(uri, PAYMENTS_ENDPOINT) {
 				// POST doesn't return anything
 				// and is processed assynchronously
 				// so we just return early
@@ -238,7 +330,7 @@ func main() {
 					log.Printf("redirecting POST data: %v\n", err)
 					return
 				}
-			} else if bytes.Equal(requestData[:len(GET_SUMMARY)], GET_SUMMARY) {
+			} else if bytes.Equal(verb, GET) && bytes.Equal(uri, PAYMENTS_SUMMARY_ENDPOINT) {
 				// This branch is severely less
 				// optimized than the previous one.
 				// The GET endpoint isn't
@@ -253,30 +345,10 @@ func main() {
 				var responseBuf []byte
 				response := bytes.NewBuffer(responseBuf)
 
-				lines := strings.Split(string(requestData[:]), "\r\n")
-				// The first line of an HTTP request is formatted as such:
-				// VERB /path/to/resource
-				// In this case:
-				// GET /payments-summary?from=2025-07-29T20:19:32.734Z&to=2025-07-29T20:19:45.690Z
-				path := strings.Split(lines[0], " ")[1]
-
 				var from, to string
-				if len(strings.Split(path, "?")) > 1 {
-					argAssignments := strings.Split(path, "?")[1]
-
-					queryArgs := make(map[string]string)
-					for _, v := range strings.Split(argAssignments, "&") {
-						assignment := strings.Split(v, "=")
-						queryArgs[assignment[0]] = assignment[1]
-					}
-
-					if v, ok := queryArgs["from"]; ok {
-						from = v
-					}
-
-					if v, ok := queryArgs["to"]; ok {
-						to = v
-					}
+				if queryArgs != nil {
+					from = queryArgs["from"]
+					to = queryArgs["to"]
 				}
 
 				// formatting request to backend
