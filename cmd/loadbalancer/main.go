@@ -16,8 +16,6 @@ import (
 	"github.com/lesismal/nbio"
 )
 
-var AMOUNT []byte
-
 var POST = []byte("POST")
 var GET = []byte("GET")
 
@@ -46,8 +44,7 @@ func pickServer() *ServerInfo {
 // zero-allocation json parser
 // only parses "correlationId" and "amount" fields
 func parseJson(buffer []byte) ([]byte, []byte, error) {
-	amount := AMOUNT
-	var correlationId []byte
+	var correlationId, amount []byte
 	var c byte
 	var pos int
 
@@ -88,13 +85,6 @@ func parseJson(buffer []byte) ([]byte, []byte, error) {
 
 			correlationId = buffer[stringStart:pos]
 		} else if c == 'a' { // amount
-			// amount is always the same in all requests
-			// so if we only parse the first occurance
-			// and reuse that
-			if amount != nil {
-				break
-			}
-
 			for c != ':' {
 				advance()
 			}
@@ -119,7 +109,6 @@ func parseJson(buffer []byte) ([]byte, []byte, error) {
 
 			var err error
 			amount = buffer[numberStart:pos]
-			AMOUNT = buffer[numberStart:pos]
 
 			if err != nil {
 				return correlationId, amount, errors.New("parsing float")
