@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"time"
 	"unicode"
 
 	"log"
@@ -13,6 +12,8 @@ import (
 	"net"
 	"os"
 	"strings"
+
+	"github.com/lesismal/nbio"
 )
 
 var AMOUNT []byte
@@ -253,158 +254,148 @@ func main() {
 		SERVERS = append(SERVERS, si)
 	}
 
-	listener, err := net.Listen("tcp", address)
+	s := pickServer()
+
+	engine := nbio.NewEngine(nbio.Config{
+		Network:            "tcp",
+		Addrs:              []string{":9999"},
+		MaxWriteBufferSize: 6 * 1024 * 1024,
+	})
+
+	engine.OnData(func(c *nbio.Conn, data []byte) {
+		verb, uri, queryArgs, err := parseRequestLine(data)
+		if err != nil {
+			log.Printf("parsing request line: %v\n", err)
+			return
+		}
+
+		if bytes.Equal(verb, POST) && bytes.Equal(uri, PAYMENTS_ENDPOINT) {
+			// POST doesn't return anything
+			// and is processed assynchronously
+			// so we just return early
+			_, err = c.Write(HTTP_200_OK_RETURN)
+			if err != nil {
+				log.Printf("writing response: %v\n", err)
+				return
+			}
+
+			correlationId, amount, err := parseJson(bodyFrom(data))
+			if err != nil {
+				log.Printf("parsing json: %v\n", err)
+				return
+			}
+
+			if len(correlationId) == 0 || len(amount) == 0 {
+				log.Printf("post body missing fields\n")
+				return
+			}
+
+			// Formatting payload to send to backend server
+			// The payload format is this:
+			// <one byte>correlationId;amount\n
+			// The first byte indicates whether we're
+			// adding a new payment to be processed or
+			// we want to retrieve a summary of payments
+			// 0x0 = process new payment
+			// 0x1 = get summary
+
+			messageBuf := make([]byte, 0, len(correlationId)+len(amount)+3) // 3 = first byte + ; + \n
+			message := bytes.NewBuffer(messageBuf)
+			message.WriteByte(uint8(0))
+			message.Write(correlationId)
+			message.WriteByte(';')
+			message.Write(amount)
+			message.WriteByte('\n')
+
+			_, err = s.Conn.Write(message.Bytes())
+			if err != nil {
+				log.Printf("redirecting POST data: %v\n", err)
+				return
+			}
+		} else if bytes.Equal(verb, GET) && bytes.Equal(uri, PAYMENTS_SUMMARY_ENDPOINT) {
+			// This branch is severely less
+			// optimized than the previous one.
+			// The GET endpoint isn't
+			// supposed to be under heavy
+			// stress, so we allow ourselves
+			// to be less performant here in
+			// order to have code that is easier
+			// to read. We have significantly more
+			// allocations and string operations here
+			// and much less raw byte manipulation.
+
+			var responseBuf []byte
+			response := bytes.NewBuffer(responseBuf)
+
+			var from, to string
+			if queryArgs != nil {
+				from = queryArgs["from"]
+				to = queryArgs["to"]
+			}
+
+			// formatting request to backend
+			// The payload format is this:
+			// <one byte>from;to\n
+			// The first byte indicates whether we're
+			// adding a new payment to be processed or
+			// we want to retrieve a summary of payments
+			// 0x0 = process new payment
+			// 0x1 = get summary
+			messageBuf := make([]byte, 0, len(from)+len(to)+3) // 3 = first byte + ; + \n
+			message := bytes.NewBuffer(messageBuf)
+			message.WriteByte(uint8(1))
+			message.WriteString(from)
+			message.WriteByte(';')
+			message.WriteString(to)
+			message.WriteByte('\n')
+
+			_, err := s.Conn.Write(message.Bytes())
+			if err != nil {
+				log.Printf("err: %v\n", err)
+				response.Write(HTTP_500_Internal_Server_Error)
+
+				c.Write(response.Bytes())
+				return
+			}
+
+			// reading backend response
+			backendResponse, err := bufio.NewReader(s.Conn).ReadBytes('\n')
+			if err != nil {
+				log.Printf("reading from backend server: %v\n", err)
+				response.Write(HTTP_500_Internal_Server_Error)
+
+				c.Write(response.Bytes())
+				return
+			}
+
+			if err != nil {
+				log.Printf("parsing summary to json: %v\n", err)
+				response.Write(HTTP_500_Internal_Server_Error)
+
+				c.Write(response.Bytes())
+				return
+			}
+
+			response.Write(HTTP_200_OK)
+			response.WriteString("Content-Type: application/json\r\n")
+			response.WriteString(fmt.Sprintf("Content-Length: %d\r\n", len(backendResponse)))
+			response.WriteString("\r\n")
+			response.Write(backendResponse)
+
+			c.Write(response.Bytes())
+		} else {
+			c.Write(HTTP_404_NOT_FOUND)
+		}
+
+	})
+	err := engine.Start()
 	if err != nil {
-		log.Printf("listening on %s: %v\n", address, err)
+		fmt.Printf("nbio.Start failed: %v\n", err)
 		return
 	}
+	defer engine.Stop()
 
 	fmt.Println("up and running")
 
-	for {
-		src, err := listener.Accept()
-		if err != nil {
-			log.Printf("accepting tcp connection: %v\n", err)
-			continue
-		}
-
-		go func() {
-			defer src.Close()
-
-			requestData := make([]byte, 512)
-			_, err := src.Read(requestData)
-			if err != nil {
-				log.Printf("reading request: %v\n", err)
-				return
-			}
-
-			verb, uri, queryArgs, err := parseRequestLine(requestData)
-			if err != nil {
-				log.Printf("parsing request line: %v\n", err)
-				return
-			}
-
-			s := pickServer()
-
-			if bytes.Equal(verb, POST) && bytes.Equal(uri, PAYMENTS_ENDPOINT) {
-				// POST doesn't return anything
-				// and is processed assynchronously
-				// so we just return early
-				_, err = src.Write(HTTP_200_OK_RETURN)
-				if err != nil {
-					log.Printf("writing response: %v\n", err)
-					return
-				}
-
-				src.Close()
-
-				correlationId, amount, err := parseJson(bodyFrom(requestData))
-				if err != nil {
-					log.Printf("parsing json: %v\n", err)
-					return
-				}
-
-				if len(correlationId) == 0 || len(amount) == 0 {
-					log.Printf("post body missing fields\n")
-					return
-				}
-
-				// Formatting payload to send to backend server
-				// The payload format is this:
-				// <one byte>correlationId;amount\n
-				// The first byte indicates whether we're
-				// adding a new payment to be processed or
-				// we want to retrieve a summary of payments
-				// 0x0 = process new payment
-				// 0x1 = get summary
-
-				messageBuf := make([]byte, 0, len(correlationId)+len(amount)+3) // 3 = first byte + ; + \n
-				message := bytes.NewBuffer(messageBuf)
-				message.WriteByte(uint8(0))
-				message.Write(correlationId)
-				message.WriteByte(';')
-				message.Write(amount)
-				message.WriteByte('\n')
-
-				_, err = s.Conn.Write(message.Bytes())
-				if err != nil {
-					log.Printf("redirecting POST data: %v\n", err)
-					return
-				}
-			} else if bytes.Equal(verb, GET) && bytes.Equal(uri, PAYMENTS_SUMMARY_ENDPOINT) {
-				// This branch is severely less
-				// optimized than the previous one.
-				// The GET endpoint isn't
-				// supposed to be under heavy
-				// stress, so we allow ourselves
-				// to be less performant here in
-				// order to have code that is easier
-				// to read. We have significantly more
-				// allocations and string operations here
-				// and much less raw byte manipulation.
-
-				var responseBuf []byte
-				response := bytes.NewBuffer(responseBuf)
-
-				var from, to string
-				if queryArgs != nil {
-					from = queryArgs["from"]
-					to = queryArgs["to"]
-				}
-
-				// formatting request to backend
-				// The payload format is this:
-				// <one byte>from;to\n
-				// The first byte indicates whether we're
-				// adding a new payment to be processed or
-				// we want to retrieve a summary of payments
-				// 0x0 = process new payment
-				// 0x1 = get summary
-				messageBuf := make([]byte, 0, len(from)+len(to)+3) // 3 = first byte + ; + \n
-				message := bytes.NewBuffer(messageBuf)
-				message.WriteByte(uint8(1))
-				message.WriteString(from)
-				message.WriteByte(';')
-				message.WriteString(to)
-				message.WriteByte('\n')
-
-				_, err := s.Conn.Write(message.Bytes())
-				if err != nil {
-					log.Printf("err: %v\n", err)
-					response.Write(HTTP_500_Internal_Server_Error)
-
-					src.Write(response.Bytes())
-					return
-				}
-
-				// reading backend response
-				backendResponse, err := bufio.NewReader(s.Conn).ReadBytes('\n')
-				if err != nil {
-					log.Printf("reading from backend server: %v\n", err)
-					response.Write(HTTP_500_Internal_Server_Error)
-
-					src.Write(response.Bytes())
-					return
-				}
-
-				if err != nil {
-					log.Printf("parsing summary to json: %v\n", err)
-					response.Write(HTTP_500_Internal_Server_Error)
-
-					src.Write(response.Bytes())
-					return
-				}
-
-				response.Write(HTTP_200_OK)
-				response.WriteString("Content-Type: application/json\r\n")
-				response.WriteString(fmt.Sprintf("Content-Length: %d\r\n", len(backendResponse)))
-				response.WriteString("\r\n")
-				response.Write(backendResponse)
-
-				src.Write(response.Bytes())
-			} else {
-				src.Write(HTTP_404_NOT_FOUND)
-			}
-		}()
-	}
+	select {}
 }
