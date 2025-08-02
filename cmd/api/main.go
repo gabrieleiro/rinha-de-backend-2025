@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"golang.design/x/lockfree"
 	"log"
 	"net"
 	"net/http"
@@ -34,15 +35,11 @@ var PAYMENT_QUEUE_URL = os.Getenv("PAYMENT_QUEUE_URL")
 const HEALTH_CHECKER_INTERVAL = 6 * time.Second
 const MAX_TIMEOUT_IN_MS = 200
 
-var paymentsQueue chan PaymentRequest = make(chan PaymentRequest, 10_000)
-var retriesQueue chan PaymentRequest = make(chan PaymentRequest, 1000)
-
 var client http.Client = http.Client{
 	Timeout: 200 * time.Millisecond,
 }
 
 var udpClient struct {
-	QueueConn   *net.UDPConn
 	TrackerConn *net.UDPConn
 }
 
@@ -252,29 +249,37 @@ func main() {
 	}
 
 	// init queues
-	for i := 0; i < 1000; i++ {
-		go func() {
-			for pr := range paymentsQueue {
-				err := tryProcessing(pr)
+	mainQueue := lockfree.NewQueue()
+	retryQueue := lockfree.NewQueue()
 
-				if err != nil {
-					retriesQueue <- pr
-				}
+	go func() {
+		for {
+			pr := mainQueue.Dequeue()
+			if pr == nil {
+				continue
 			}
-		}()
-	}
 
-	for i := 0; i < 100; i++ {
-		go func() {
-			for pr := range retriesQueue {
-				err := tryProcessing(pr)
-
-				if err != nil {
-					retriesQueue <- pr
-				}
+			err := tryProcessing(pr.(PaymentRequest))
+			if err != nil {
+				log.Printf("retrying\n")
+				retryQueue.Enqueue(pr)
 			}
-		}()
-	}
+		}
+	}()
+
+	go func() {
+		for {
+			pr := retryQueue.Dequeue()
+			if pr == nil {
+				continue
+			}
+
+			err := tryProcessing(pr.(PaymentRequest))
+			if err != nil {
+				retryQueue.Enqueue(pr)
+			}
+		}
+	}()
 
 	fmt.Println("up and running")
 
@@ -304,9 +309,9 @@ func main() {
 					return
 				}
 
-				paymentsQueue <- PaymentRequest{amount, params[0], ""}
+				mainQueue.Enqueue(PaymentRequest{amount, params[0], ""})
 			} else { // GET
-				paymentsSummary(addr, data)
+				go paymentsSummary(addr, data)
 			}
 		}()
 	}
