@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"time"
 	"unicode"
 
 	"log"
@@ -21,8 +22,8 @@ var GET = []byte("GET")
 
 var HTTP_200_OK = []byte("HTTP/1.1 200 OK\r\n")
 var HTTP_200_OK_RETURN = []byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-var HTTP_500_Internal_Server_Error = []byte("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n")
-var HTTP_404_NOT_FOUND = []byte("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n")
+var HTTP_500_Internal_Server_Error = []byte("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
+var HTTP_404_NOT_FOUND = []byte("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
 
 var BODY_SEPARATOR = []byte("\r\n\r\n")
 
