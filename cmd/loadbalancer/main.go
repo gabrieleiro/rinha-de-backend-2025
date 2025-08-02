@@ -257,9 +257,9 @@ func main() {
 	s := pickServer()
 
 	engine := nbio.NewEngine(nbio.Config{
-		Network:            "tcp",
-		Addrs:              []string{":9999"},
-		MaxWriteBufferSize: 6 * 1024 * 1024,
+		Network:        "tcp",
+		Addrs:          []string{address},
+		ReadBufferSize: 512,
 	})
 
 	engine.OnData(func(c *nbio.Conn, data []byte) {
