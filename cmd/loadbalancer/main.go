@@ -355,7 +355,7 @@ func main() {
 			}
 
 			// reading backend response
-			backendResponseBuf := make([]byte, 5012)
+			backendResponseBuf := make([]byte, 512)
 			bytesRead, _, err := unixgramConn.ReadFromUnix(backendResponseBuf)
 			if err != nil {
 				log.Printf("reading from backend server: %v\n", err)
@@ -365,17 +365,18 @@ func main() {
 				return
 			}
 
+			backendResponse := backendResponseBuf[1:bytesRead]
+
 			response.Write(HTTP_200_OK)
 			response.WriteString("Content-Type: application/json\r\n")
-			response.WriteString(fmt.Sprintf("Content-Length: %d\r\n", bytesRead-1))
+			response.WriteString(fmt.Sprintf("Content-Length: %d\r\n", len(backendResponse)))
 			response.WriteString("\r\n")
-			response.Write(backendResponseBuf[:bytesRead-1])
+			response.Write(backendResponse)
 
 			c.Write(response.Bytes())
 		} else {
 			c.Write(HTTP_404_NOT_FOUND)
 		}
-
 	})
 
 	err = engine.Start()
