@@ -1,16 +1,13 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
 	"log"
 	"net"
 	"os"
-	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -122,36 +119,25 @@ func (t *Tracker) RangedSummary(from, to *time.Time) string {
 
 func main() {
 	address := os.Getenv("ADDRESS")
-	if address == "" {
-		address = "/tmp/rinha_tracker.sock"
-	}
 
-	unixgramAddr, err := net.ResolveUnixAddr("unixgram", address)
+	udpAddr, err := net.ResolveUDPAddr("udp", address)
 	if err != nil {
 		log.Printf("resolving address: %v\n", err)
 		return
 	}
 
-	conn, err := net.ListenUnixgram("unixgram", unixgramAddr)
+	client.Conn, err = net.ListenUDP("udp", udpAddr)
 	if err != nil {
 		log.Printf("dialing connection: %v\n", err)
 		return
 	}
-
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-c
-		os.Remove(address)
-		os.Exit(1)
-	}()
 
 	fmt.Println("up and running")
 
 	for {
 		var buf [512]byte
 
-		n, clientAddr, err := conn.ReadFromUnix(buf[0:])
+		n, addr, err := client.Conn.ReadFromUDP(buf[0:])
 		if err != nil {
 			log.Printf("reading from connection: %v\n", err)
 			continue
@@ -211,12 +197,8 @@ func main() {
 					to = &t
 				}
 
-				var response bytes.Buffer
 				summary := tracker.RangedSummary(from, to)
-
-				response.WriteByte(2)
-				response.WriteString(summary)
-				conn.WriteTo(response.Bytes(), clientAddr)
+				client.Conn.WriteToUDP([]byte(summary), addr)
 			} else {
 				log.Printf("unrecognized message: %v\n", string(buf[0:]))
 			}
