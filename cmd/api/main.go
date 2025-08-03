@@ -6,16 +6,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"golang.design/x/lockfree"
 	"log"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+
+	"golang.design/x/lockfree"
 )
 
 var DEFAULT_PROCESSOR_URL = os.Getenv("DEFAULT_PROCESSOR_URL")
@@ -43,9 +46,7 @@ var udpClient struct {
 	TrackerConn *net.UDPConn
 }
 
-var udpServer struct {
-	Conn *net.UDPConn
-}
+var serverConn *net.UnixConn
 
 var httpClient http.Client = http.Client{
 	Timeout: 2000 * time.Millisecond,
@@ -194,7 +195,7 @@ type Request struct {
 	r *http.Request
 }
 
-func paymentsSummary(addr *net.UDPAddr, payload []byte) {
+func paymentsSummary(addr *net.UnixAddr, payload []byte) {
 	_, err := udpClient.TrackerConn.Write(append(payload, '\n'))
 	if err != nil {
 		log.Printf("sending message to tracker: %v\n", err)
@@ -207,7 +208,7 @@ func paymentsSummary(addr *net.UDPAddr, payload []byte) {
 		return
 	}
 
-	udpServer.Conn.WriteToUDP(trackerResponse, addr)
+	serverConn.WriteToUnix(trackerResponse, addr)
 }
 
 func dialUDP(addressString string) (*net.UDPConn, error) {
@@ -236,15 +237,15 @@ func main() {
 	}
 	defer udpClient.TrackerConn.Close()
 
-	udpAddr, err := net.ResolveUDPAddr("udp", serverAddress)
+	unixAddr, err := net.ResolveUnixAddr("unixgram", serverAddress)
 	if err != nil {
 		log.Printf("resolving address: %v\n", err)
 		return
 	}
 
-	udpServer.Conn, err = net.ListenUDP("udp", udpAddr)
+	serverConn, err = net.ListenUnixgram("unixgram", unixAddr)
 	if err != nil {
-		log.Printf("listening on UDP port: %v\n", err)
+		log.Printf("listening unix socket: %v\n", err)
 		return
 	}
 
@@ -283,11 +284,19 @@ func main() {
 
 	fmt.Println("up and running")
 
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-c
+		os.Remove(serverAddress)
+		os.Exit(1)
+	}()
+
 	// listen to messages from load balancer
 	for {
 		var buf [512]byte
 
-		n, addr, err := udpServer.Conn.ReadFromUDP(buf[:])
+		n, addr, err := serverConn.ReadFromUnix(buf[:])
 		if err != nil {
 			log.Printf("reading from connection: %v\n", err)
 			continue
@@ -315,4 +324,5 @@ func main() {
 			}
 		}()
 	}
+
 }

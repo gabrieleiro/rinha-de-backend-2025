@@ -33,7 +33,7 @@ var SERVERS = []ServerInfo{}
 
 type ServerInfo struct {
 	Address string
-	Conn    *net.UDPConn
+	Conn    *net.UnixConn
 }
 
 func pickServer() *ServerInfo {
@@ -228,15 +228,17 @@ func main() {
 	// set up connection to servers
 	for _, sa := range serverAddresses {
 		si := ServerInfo{Address: sa}
-		udpAddr, err := net.ResolveUDPAddr("udp", sa)
+
+		var err error
+		unixAddr, err := net.ResolveUnixAddr("unixgram", sa)
 		if err != nil {
-			log.Printf("resolving udp address: %v\n", sa)
+			log.Printf("resolving address: %v\n", err)
 			return
 		}
 
-		si.Conn, err = net.DialUDP("udp", nil, udpAddr)
+		si.Conn, err = net.DialUnix("unixgram", nil, unixAddr)
 		if err != nil {
-			log.Printf("dialing udp server: %v\n", err)
+			log.Printf("dialing unix socket: %v\n", err)
 			return
 		}
 
