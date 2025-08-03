@@ -36,8 +36,6 @@ var FALLBACK_PROCESSOR_URL = os.Getenv("FALLBACK_PROCESSOR_URL")
 var FALLBACK_PAYMENTS_ENDPOINT = FALLBACK_PROCESSOR_URL + "/payments"
 var FALLBACK_SERVICE_HEALTH_ENDPOINT = FALLBACK_PROCESSOR_URL + "/payments/service-health"
 
-var TRACKER_URI = os.Getenv("TRACKER_URI")
-
 var PAYMENT_QUEUE_URL = os.Getenv("PAYMENT_QUEUE_URL")
 
 const HEALTH_CHECKER_INTERVAL = 6 * time.Second
@@ -207,14 +205,23 @@ func paymentsSummary(addr *net.UnixAddr, payload []byte) {
 
 func main() {
 	serverAddress := os.Getenv("ADDRESS")
+	if serverAddress == "" {
+		serverAddress = "/tmp/rinha_api1_conn.sock"
+	}
+
 	loadBalancerURI := os.Getenv("LOAD_BALANCER_URI")
 	if loadBalancerURI == "" {
 		loadBalancerURI = "/tmp/rinha_load_balancer.sock"
 	}
 
+	var trackerURI = os.Getenv("TRACKER_URI")
+	if trackerURI == "" {
+		trackerURI = "/tmp/rinha_tracker.sock"
+	}
+
 	// networking
 	var err error
-	trackerAddr, err = net.ResolveUnixAddr("unixgram", TRACKER_URI)
+	trackerAddr, err = net.ResolveUnixAddr("unixgram", trackerURI)
 	if err != nil {
 		log.Printf("listening on tracker socket: %v\n", err)
 		return
@@ -295,24 +302,24 @@ func main() {
 
 			switch MessageType(data[0]) {
 			case ProcessPayment:
-				params := strings.Split(string(data[1:]), ";")
-				if len(params) != 2 || params[0] == "" || params[1] == "" {
+				params := bytes.Split(data[1:], []byte{';'})
+
+				if len(params) != 2 || len(params[0]) == 0 || len(params[1]) == 0 {
 					log.Printf("malformed message: %v\n", string(data[1:]))
 					return
 				}
 
-				amount, err := strconv.ParseFloat(params[1], 64)
+				amount, err := strconv.ParseFloat(string(params[1]), 64)
 				if err != nil {
 					log.Printf("parsing float: %v\n", err)
 					return
 				}
 
-				mainQueue.Enqueue(PaymentRequest{amount, params[0], ""})
+				mainQueue.Enqueue(PaymentRequest{amount, string(params[0]), ""})
 			case RetrieveSummary:
-				log.Printf("retrieve summary\n")
-				go paymentsSummary(addr, data)
+				paymentsSummary(addr, data)
 			case Summary:
-				go serverConn.WriteTo(data, lbAddr)
+				serverConn.WriteTo(data, lbAddr)
 			default:
 				log.Printf("unrecognized message: %v\n", string(data))
 			}
