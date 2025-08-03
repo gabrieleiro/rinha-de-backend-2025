@@ -1,10 +1,11 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
+	"os/signal"
+	"syscall"
 	"unicode"
 
 	"log"
@@ -225,23 +226,27 @@ func main() {
 		address = ":9999"
 	}
 
+	unixgramSocketPath := os.Getenv("ADDRESS_UNIX")
+	if unixgramSocketPath == "" {
+		unixgramSocketPath = "/tmp/rinha_load_balancer.sock"
+	}
+
+	var err error
+	unixAddr, err := net.ResolveUnixAddr("unixgram", unixgramSocketPath)
+	if err != nil {
+		log.Printf("resolving address: %v\n", err)
+		return
+	}
+
+	unixgramConn, err := net.ListenUnixgram("unixgram", unixAddr)
+	if err != nil {
+		log.Printf("listening unix socket: %v\n", err)
+		return
+	}
+
 	// set up connection to servers
 	for _, sa := range serverAddresses {
 		si := ServerInfo{Address: sa}
-
-		var err error
-		unixAddr, err := net.ResolveUnixAddr("unixgram", sa)
-		if err != nil {
-			log.Printf("resolving address: %v\n", err)
-			return
-		}
-
-		si.Conn, err = net.DialUnix("unixgram", nil, unixAddr)
-		if err != nil {
-			log.Printf("dialing unix socket: %v\n", err)
-			return
-		}
-
 		SERVERS = append(SERVERS, si)
 	}
 
@@ -298,7 +303,7 @@ func main() {
 			message.Write(amount)
 			message.WriteByte('\n')
 
-			_, err = s.Conn.Write(message.Bytes())
+			_, err = unixgramConn.WriteTo(message.Bytes(), &net.UnixAddr{Name: s.Address, Net: "unixgram"})
 			if err != nil {
 				log.Printf("redirecting POST data: %v\n", err)
 				return
@@ -340,7 +345,7 @@ func main() {
 			message.WriteString(to)
 			message.WriteByte('\n')
 
-			_, err := s.Conn.Write(message.Bytes())
+			_, err := unixgramConn.WriteTo(message.Bytes(), &net.UnixAddr{Name: s.Address, Net: "unixgram"})
 			if err != nil {
 				log.Printf("err: %v\n", err)
 				response.Write(HTTP_500_Internal_Server_Error)
@@ -350,7 +355,8 @@ func main() {
 			}
 
 			// reading backend response
-			backendResponse, err := bufio.NewReader(s.Conn).ReadBytes('\n')
+			backendResponseBuf := make([]byte, 5012)
+			bytesRead, _, err := unixgramConn.ReadFromUnix(backendResponseBuf)
 			if err != nil {
 				log.Printf("reading from backend server: %v\n", err)
 				response.Write(HTTP_500_Internal_Server_Error)
@@ -359,19 +365,11 @@ func main() {
 				return
 			}
 
-			if err != nil {
-				log.Printf("parsing summary to json: %v\n", err)
-				response.Write(HTTP_500_Internal_Server_Error)
-
-				c.Write(response.Bytes())
-				return
-			}
-
 			response.Write(HTTP_200_OK)
 			response.WriteString("Content-Type: application/json\r\n")
-			response.WriteString(fmt.Sprintf("Content-Length: %d\r\n", len(backendResponse)))
+			response.WriteString(fmt.Sprintf("Content-Length: %d\r\n", bytesRead-1))
 			response.WriteString("\r\n")
-			response.Write(backendResponse)
+			response.Write(backendResponseBuf[:bytesRead-1])
 
 			c.Write(response.Bytes())
 		} else {
@@ -379,7 +377,8 @@ func main() {
 		}
 
 	})
-	err := engine.Start()
+
+	err = engine.Start()
 	if err != nil {
 		fmt.Printf("nbio.Start failed: %v\n", err)
 		return
@@ -387,6 +386,14 @@ func main() {
 	defer engine.Stop()
 
 	fmt.Println("up and running")
+
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-c
+		os.Remove(unixgramSocketPath)
+		os.Exit(1)
+	}()
 
 	select {}
 }
