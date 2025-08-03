@@ -261,7 +261,6 @@ func main() {
 
 			err := tryProcessing(pr.(PaymentRequest))
 			if err != nil {
-				log.Printf("retrying\n")
 				retryQueue.Enqueue(pr)
 			}
 		}
