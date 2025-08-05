@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"golang.design/x/lockfree"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.design/x/lockfree"
 )
 
 var DEFAULT_PROCESSOR_URL = os.Getenv("DEFAULT_PROCESSOR_URL")
@@ -117,6 +119,8 @@ func tryPay(endpoint string, pr PaymentRequest) error {
 		return err
 	}
 	defer response.Body.Close()
+
+	io.Copy(io.Discard, response.Body)
 
 	if response.StatusCode != http.StatusOK {
 		// If the error is not on their end,
