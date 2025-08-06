@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.design/x/lockfree"
 )
 
 var DEFAULT_PROCESSOR_URL = os.Getenv("DEFAULT_PROCESSOR_URL")
@@ -33,13 +35,13 @@ var TRACK_PAYMENTS_ENDPOINT = TRACKER_URL + "/track"
 var PAYMENT_QUEUE_URL = os.Getenv("PAYMENT_QUEUE_URL")
 
 const HEALTH_CHECKER_INTERVAL = 6 * time.Second
-const MAX_TIMEOUT_IN_MS = 200
+const MAX_TIMEOUT_IN_MS = 150
 
-var mainQueue chan PaymentRequest
-var retryQueue chan PaymentRequest
+var mainQueue *lockfree.Queue
+var retryQueue *lockfree.Queue
 
 var client http.Client = http.Client{
-	Timeout: 200 * time.Millisecond,
+	Timeout: 150 * time.Millisecond,
 }
 
 var udpClient struct {
@@ -253,40 +255,40 @@ func main() {
 	}
 
 	// init queues
-	mainQueue = make(chan PaymentRequest, 10_000)
-	retryQueue = make(chan PaymentRequest, 1000)
+	mainQueue = lockfree.NewQueue()
+	retryQueue = lockfree.NewQueue()
 
-	for range 4 {
-		go func() {
-			for {
-				pr := <-mainQueue
-
-				err := tryProcessing(pr)
-				if err != nil {
-					time.Sleep(time.Duration(50) * time.Millisecond)
-					retryQueue <- pr
-				}
+	go func() {
+		for {
+			pr := mainQueue.Dequeue()
+			if pr == nil {
+				continue
 			}
-		}()
-	}
 
-	for range 4 {
-		go func() {
-			for {
-				pr := <-retryQueue
-
-				err := tryProcessing(pr)
-				if err != nil {
-					time.Sleep(time.Duration(50) * time.Millisecond)
-					retryQueue <- pr
-				}
+			err := tryProcessing(pr.(PaymentRequest))
+			if err != nil {
+				time.Sleep(time.Duration(50) * time.Millisecond)
+				retryQueue.Enqueue(pr)
 			}
-		}()
-	}
+		}
+	}()
+
+	go func() {
+		for {
+			pr := retryQueue.Dequeue()
+			if pr == nil {
+				continue
+			}
+
+			err := tryProcessing(pr.(PaymentRequest))
+			if err != nil {
+				time.Sleep(time.Duration(50) * time.Millisecond)
+				retryQueue.Enqueue(pr)
+			}
+		}
+	}()
 
 	fmt.Println("up and running")
-
-	incomingMessages := make(chan struct{}, 10)
 
 	// listen to messages from load balancer
 	for {
@@ -300,12 +302,7 @@ func main() {
 
 		data := buf[:n-1]
 
-		incomingMessages <- struct{}{}
 		go func() {
-			defer func() {
-				<-incomingMessages
-			}()
-
 			if data[0] == 0 { // POST
 				params := strings.Split(string(data[1:]), ";")
 				if len(params) != 2 || params[0] == "" || params[1] == "" {
@@ -319,9 +316,9 @@ func main() {
 					return
 				}
 
-				mainQueue <- PaymentRequest{amount, params[0], ""}
+				mainQueue.Enqueue(PaymentRequest{amount, params[0], ""})
 			} else { // GET
-				go paymentsSummary(addr, data)
+				paymentsSummary(addr, data)
 			}
 		}()
 
