@@ -5,10 +5,10 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"unicode"
 
 	"log"
-	"math/rand"
 	"net"
 	"os"
 	"strings"
@@ -30,6 +30,7 @@ var PAYMENTS_ENDPOINT = []byte("/payments")
 var PAYMENTS_SUMMARY_ENDPOINT = []byte("/payments-summary")
 
 var SERVERS = []ServerInfo{}
+var pickerIndex uint32
 
 type ServerInfo struct {
 	Address string
@@ -38,7 +39,7 @@ type ServerInfo struct {
 
 func pickServer() *ServerInfo {
 	// I mean... it's just two servers anyway
-	return &SERVERS[rand.Intn(len(SERVERS))]
+	return &SERVERS[int(pickerIndex)%len(SERVERS)]
 }
 
 // zero-allocation json parser
@@ -236,14 +237,11 @@ func main() {
 
 		si.Conn, err = net.DialUDP("udp", nil, udpAddr)
 		if err != nil {
-			log.Printf("dialing udp server: %v\n", err)
 			return
 		}
 
 		SERVERS = append(SERVERS, si)
 	}
-
-	s := pickServer()
 
 	engine := nbio.NewEngine(nbio.Config{
 		Network:        "tcp",
@@ -252,6 +250,9 @@ func main() {
 	})
 
 	engine.OnData(func(c *nbio.Conn, data []byte) {
+		s := pickServer()
+		atomic.AddUint32(&pickerIndex, 1)
+
 		verb, uri, queryArgs, err := parseRequestLine(data)
 		if err != nil {
 			log.Printf("parsing request line: %v\n", err)
