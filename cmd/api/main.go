@@ -16,8 +16,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"golang.design/x/lockfree"
 )
 
 var DEFAULT_PROCESSOR_URL = os.Getenv("DEFAULT_PROCESSOR_URL")
@@ -36,6 +34,9 @@ var PAYMENT_QUEUE_URL = os.Getenv("PAYMENT_QUEUE_URL")
 
 const HEALTH_CHECKER_INTERVAL = 6 * time.Second
 const MAX_TIMEOUT_IN_MS = 200
+
+var mainQueue chan PaymentRequest
+var retryQueue chan PaymentRequest
 
 var client http.Client = http.Client{
 	Timeout: 200 * time.Millisecond,
@@ -147,15 +148,13 @@ func tryPay(endpoint string, pr PaymentRequest) error {
 }
 
 func tryProcessing(pr PaymentRequest) error {
-	if healthChecker.Default.Failing && healthChecker.Fallback.Failing {
-		return errors.New("both processors are down")
-	}
+	defaultTime := healthChecker.Default.MinResponseTime
+	fallbackTime := healthChecker.Default.MinResponseTime
 
-	if healthChecker.Default.MinResponseTime > MAX_TIMEOUT_IN_MS && healthChecker.Fallback.MinResponseTime > MAX_TIMEOUT_IN_MS {
-		return errors.New("both processors are slow")
-	}
+	defaultGood := !healthChecker.Default.Failing && defaultTime < MAX_TIMEOUT_IN_MS
+	fallbackGood := !healthChecker.Fallback.Failing && fallbackTime < MAX_TIMEOUT_IN_MS
 
-	if !healthChecker.Default.Failing && healthChecker.Default.MinResponseTime < MAX_TIMEOUT_IN_MS {
+	if defaultGood {
 		now := time.Now().UTC()
 		pr.RequestedAt = now.UTC().Format(time.RFC3339Nano)
 		err := tryPay(DEFAULT_PAYMENTS_ENDPOINT, pr)
@@ -164,9 +163,7 @@ func tryProcessing(pr PaymentRequest) error {
 			trackPayment(pr, "default")
 			return nil
 		}
-	}
-
-	if !healthChecker.Fallback.Failing && healthChecker.Default.MinResponseTime < MAX_TIMEOUT_IN_MS {
+	} else if fallbackGood {
 		now := time.Now().UTC()
 		pr.RequestedAt = now.UTC().Format(time.RFC3339Nano)
 		err := tryPay(FALLBACK_PAYMENTS_ENDPOINT, pr)
@@ -177,6 +174,9 @@ func tryProcessing(pr PaymentRequest) error {
 		} else {
 			return err
 		}
+	} else {
+		time.Sleep(time.Duration(min(defaultTime, fallbackTime)) * time.Millisecond)
+		return errors.New("both processors are bad")
 	}
 
 	return errors.New("undefined error")
@@ -253,38 +253,40 @@ func main() {
 	}
 
 	// init queues
-	mainQueue := lockfree.NewQueue()
-	retryQueue := lockfree.NewQueue()
+	mainQueue = make(chan PaymentRequest, 10_000)
+	retryQueue = make(chan PaymentRequest, 1000)
 
-	go func() {
-		for {
-			pr := mainQueue.Dequeue()
-			if pr == nil {
-				continue
-			}
+	for range 4 {
+		go func() {
+			for {
+				pr := <-mainQueue
 
-			err := tryProcessing(pr.(PaymentRequest))
-			if err != nil {
-				retryQueue.Enqueue(pr)
+				err := tryProcessing(pr)
+				if err != nil {
+					time.Sleep(time.Duration(50) * time.Millisecond)
+					retryQueue <- pr
+				}
 			}
-		}
-	}()
+		}()
+	}
 
-	go func() {
-		for {
-			pr := retryQueue.Dequeue()
-			if pr == nil {
-				continue
-			}
+	for range 4 {
+		go func() {
+			for {
+				pr := <-retryQueue
 
-			err := tryProcessing(pr.(PaymentRequest))
-			if err != nil {
-				retryQueue.Enqueue(pr)
+				err := tryProcessing(pr)
+				if err != nil {
+					time.Sleep(time.Duration(50) * time.Millisecond)
+					retryQueue <- pr
+				}
 			}
-		}
-	}()
+		}()
+	}
 
 	fmt.Println("up and running")
+
+	incomingMessages := make(chan struct{}, 10)
 
 	// listen to messages from load balancer
 	for {
@@ -296,8 +298,13 @@ func main() {
 			continue
 		}
 
+		data := buf[:n-1]
+
+		incomingMessages <- struct{}{}
 		go func() {
-			data := buf[:n-1]
+			defer func() {
+				<-incomingMessages
+			}()
 
 			if data[0] == 0 { // POST
 				params := strings.Split(string(data[1:]), ";")
@@ -312,10 +319,11 @@ func main() {
 					return
 				}
 
-				mainQueue.Enqueue(PaymentRequest{amount, params[0], ""})
+				mainQueue <- PaymentRequest{amount, params[0], ""}
 			} else { // GET
 				go paymentsSummary(addr, data)
 			}
 		}()
+
 	}
 }
