@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
@@ -12,12 +11,22 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.design/x/lockfree"
+)
+
+type MessageType uint8
+
+const (
+	ProcessPayment MessageType = iota
+	RetrieveSummary
+	Summary
 )
 
 var DEFAULT_PROCESSOR_URL = os.Getenv("DEFAULT_PROCESSOR_URL")
@@ -40,16 +49,12 @@ const MAX_TIMEOUT_IN_MS = 150
 var mainQueue *lockfree.Queue
 var retryQueue *lockfree.Queue
 
+var serverConn *net.UnixConn
+var trackerAddr *net.UnixAddr
+var lbAddr *net.UnixAddr
+
 var client http.Client = http.Client{
 	Timeout: 150 * time.Millisecond,
-}
-
-var udpClient struct {
-	TrackerConn *net.UDPConn
-}
-
-var udpServer struct {
-	Conn *net.UDPConn
 }
 
 var httpClient http.Client = http.Client{
@@ -163,8 +168,9 @@ func tryProcessing(pr PaymentRequest) error {
 
 		if err == nil {
 			trackPayment(pr, "default")
-			return nil
 		}
+
+		return err
 	} else if fallbackGood {
 		now := time.Now().UTC()
 		pr.RequestedAt = now.UTC().Format(time.RFC3339Nano)
@@ -172,85 +178,72 @@ func tryProcessing(pr PaymentRequest) error {
 
 		if err == nil {
 			trackPayment(pr, "fallback")
-			return nil
-		} else {
-			return err
 		}
+
+		return err
 	} else {
 		time.Sleep(time.Duration(min(defaultTime, fallbackTime)) * time.Millisecond)
 		return errors.New("both processors are bad")
 	}
-
-	return errors.New("undefined error")
 }
 
 func trackPayment(pr PaymentRequest, processor string) {
 	var message strings.Builder
 	message.WriteByte(0)
 	message.WriteString(fmt.Sprintf("%s;%f;%s\n", processor, pr.Amount, pr.RequestedAt))
-	_, err := udpClient.TrackerConn.Write([]byte(message.String()))
+	_, err := serverConn.WriteTo([]byte(message.String()), trackerAddr)
 	if err != nil {
 		log.Printf("sending message to tracker: %v\n", err)
 		return
 	}
 }
 
-type Request struct {
-	w http.ResponseWriter
-	r *http.Request
-}
-
-func paymentsSummary(addr *net.UDPAddr, payload []byte) {
-	_, err := udpClient.TrackerConn.Write(append(payload, '\n'))
+func paymentsSummary(payload []byte) {
+	_, err := serverConn.WriteTo(append(payload, '\n'), trackerAddr)
 	if err != nil {
 		log.Printf("sending message to tracker: %v\n", err)
 		return
 	}
-
-	trackerResponse, err := bufio.NewReader(udpClient.TrackerConn).ReadBytes('\n')
-	if err != nil {
-		log.Printf("reading from tracker: %v\n", err)
-		return
-	}
-
-	udpServer.Conn.WriteToUDP(trackerResponse, addr)
-}
-
-func dialUDP(addressString string) (*net.UDPConn, error) {
-	udpAddr, err := net.ResolveUDPAddr("udp", addressString)
-	if err != nil {
-		return nil, err
-	}
-
-	conn, err := net.DialUDP("udp", nil, udpAddr)
-	if err != nil {
-		return nil, err
-	}
-
-	return conn, nil
 }
 
 func main() {
 	serverAddress := os.Getenv("ADDRESS")
+	os.Remove(serverAddress)
 
 	// networking
+
+	loadBalancerURI := os.Getenv("LOAD_BALANCER_URI")
+	if loadBalancerURI == "" {
+		loadBalancerURI = "./sockets/rinha_load_balancer.sock"
+	}
+
+	var trackerURI = os.Getenv("TRACKER_URI")
+	if trackerURI == "" {
+		trackerURI = "./sockets/rinha_tracker.sock"
+	}
+
 	var err error
-	udpClient.TrackerConn, err = dialUDP(TRACKER_URL)
+	trackerAddr, err = net.ResolveUnixAddr("unixgram", trackerURI)
 	if err != nil {
-		log.Printf("initing udp client: %v\n", err)
-		return
-	}
-	defer udpClient.TrackerConn.Close()
-
-	udpAddr, err := net.ResolveUDPAddr("udp", serverAddress)
-	if err != nil {
-		log.Printf("resolving address: %v\n", err)
+		log.Printf("resolving tracker URI: %v\n", err)
 		return
 	}
 
-	udpServer.Conn, err = net.ListenUDP("udp", udpAddr)
+	lbAddr, err = net.ResolveUnixAddr("unixgram", loadBalancerURI)
 	if err != nil {
-		log.Printf("listening on UDP port: %v\n", err)
+		log.Printf("resolving load balancer URI: %v\n", err)
+		return
+	}
+
+	serverAddr, err := net.ResolveUnixAddr("unixgram", serverAddress)
+	if err != nil {
+		log.Printf("resolving server URI: %v\n", err)
+		return
+	}
+
+	serverConn, err = net.ListenUnixgram("unixgram", serverAddr)
+	if err != nil {
+		log.Printf("listening on socket: %v\n", err)
 		return
 	}
 
@@ -258,6 +251,7 @@ func main() {
 	mainQueue = lockfree.NewQueue()
 	retryQueue = lockfree.NewQueue()
 
+	// consume main queue
 	go func() {
 		for {
 			pr := mainQueue.Dequeue()
@@ -273,6 +267,7 @@ func main() {
 		}
 	}()
 
+	// consume retry queue
 	go func() {
 		for {
 			pr := retryQueue.Dequeue()
@@ -288,22 +283,21 @@ func main() {
 		}
 	}()
 
-	fmt.Println("up and running")
-
 	// listen to messages from load balancer
-	for {
-		var buf [512]byte
+	go func() {
+		for {
+			var buf [512]byte
 
-		n, addr, err := udpServer.Conn.ReadFromUDP(buf[:])
-		if err != nil {
-			log.Printf("reading from connection: %v\n", err)
-			continue
-		}
+			n, _, err := serverConn.ReadFromUnix(buf[:])
+			if err != nil {
+				log.Printf("reading from connection: %v\n", err)
+				continue
+			}
 
-		data := buf[:n-1]
+			data := buf[:n-1]
 
-		go func() {
-			if data[0] == 0 { // POST
+			switch MessageType(data[0]) {
+			case ProcessPayment:
 				params := strings.Split(string(data[1:]), ";")
 				if len(params) != 2 || params[0] == "" || params[1] == "" {
 					log.Printf("malformed message: %v\n", string(data[1:]))
@@ -317,10 +311,22 @@ func main() {
 				}
 
 				mainQueue.Enqueue(PaymentRequest{amount, params[0], ""})
-			} else { // GET
-				paymentsSummary(addr, data)
+			case RetrieveSummary:
+				go paymentsSummary(data)
+			case Summary:
+				go serverConn.WriteTo(data, lbAddr)
+			default:
+				log.Printf("unrecognized message: %v\n", string(data))
 			}
-		}()
+		}
+	}()
 
-	}
+	fmt.Println("up and running")
+
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+
+	<-c
+	os.Remove(serverAddress)
+	os.Exit(1)
 }

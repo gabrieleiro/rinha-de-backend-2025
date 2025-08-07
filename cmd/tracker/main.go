@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -119,31 +122,33 @@ func (t *Tracker) RangedSummary(from, to *time.Time) string {
 
 func main() {
 	address := os.Getenv("ADDRESS")
+	if address == "" {
+		address = "./sockets/rinha_tracker.sock"
+	}
+	os.Remove(address)
 
-	udpAddr, err := net.ResolveUDPAddr("udp", address)
+	unixgramAddr, err := net.ResolveUnixAddr("unixgram", address)
 	if err != nil {
 		log.Printf("resolving address: %v\n", err)
 		return
 	}
 
-	client.Conn, err = net.ListenUDP("udp", udpAddr)
+	conn, err := net.ListenUnixgram("unixgram", unixgramAddr)
 	if err != nil {
-		log.Printf("dialing connection: %v\n", err)
+		log.Printf("listening on socket: %v\n", err)
 		return
 	}
 
-	fmt.Println("up and running")
+	go func() {
+		for {
+			var buf [512]byte
 
-	for {
-		var buf [512]byte
+			n, addr, err := conn.ReadFromUnix(buf[0:])
+			if err != nil {
+				log.Printf("reading from connection: %v\n", err)
+				continue
+			}
 
-		n, addr, err := client.Conn.ReadFromUDP(buf[0:])
-		if err != nil {
-			log.Printf("reading from connection: %v\n", err)
-			continue
-		}
-
-		go func() {
 			data := buf[:n-1]
 
 			// The first byte of the payload
@@ -165,7 +170,7 @@ func main() {
 				amount, err := strconv.ParseFloat(params[1], 64)
 				if err != nil {
 					log.Printf("parsing float: %v\n", err)
-					return
+					continue
 				}
 
 				go tracker.Track(TrackRequest{
@@ -181,7 +186,7 @@ func main() {
 					t, err := time.Parse(time.RFC3339Nano, params[0])
 					if err != nil {
 						log.Printf("parsing from timestamp %v\n", err)
-						return
+						continue
 					}
 
 					from = &t
@@ -197,11 +202,23 @@ func main() {
 					to = &t
 				}
 
+				var response bytes.Buffer
+
 				summary := tracker.RangedSummary(from, to)
-				client.Conn.WriteToUDP([]byte(summary), addr)
+				response.WriteByte(2)
+				response.WriteString(summary)
+				conn.WriteTo(response.Bytes(), addr)
 			} else {
 				log.Printf("unrecognized message: %v\n", string(buf[0:]))
 			}
-		}()
-	}
+		}
+	}()
+
+	fmt.Println("up and running")
+
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	<-c
+	os.Remove(address)
+	os.Exit(1)
 }

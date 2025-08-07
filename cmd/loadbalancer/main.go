@@ -1,11 +1,12 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
+	"os/signal"
 	"sync/atomic"
+	"syscall"
 	"unicode"
 
 	"log"
@@ -33,8 +34,9 @@ var SERVERS = []ServerInfo{}
 var pickerIndex uint32
 
 type ServerInfo struct {
-	Address string
-	Conn    *net.UDPConn
+	Address           string
+	Conn              *net.UnixConn
+	UnixSocketAddress *net.UnixAddr
 }
 
 func pickServer() *ServerInfo {
@@ -221,31 +223,45 @@ func main() {
 		return
 	}
 
-	address := os.Getenv("ADDRESS")
-	if address == "" {
-		address = ":9999"
+	tcpAddress := os.Getenv("TCP_ADDRESS")
+	if tcpAddress == "" {
+		tcpAddress = ":9999"
+	}
+
+	unixSocketPath := os.Getenv("UNIX_SOCKET_ADDRESS")
+	if unixSocketPath == "" {
+		unixSocketPath = "./sockets/rinha_load_balancer.sock"
+	}
+
+	os.Remove(unixSocketPath)
+
+	var err error
+	unixAddr, err := net.ResolveUnixAddr("unixgram", unixSocketPath)
+	if err != nil {
+		log.Printf("resolving address: %v\n", err)
+		return
+	}
+
+	unixgramConn, err := net.ListenUnixgram("unixgram", unixAddr)
+	if err != nil {
+		log.Printf("listening unix socket: %v\n", err)
+		return
 	}
 
 	// set up connection to servers
 	for _, sa := range serverAddresses {
 		si := ServerInfo{Address: sa}
-		udpAddr, err := net.ResolveUDPAddr("udp", sa)
+		si.UnixSocketAddress, err = net.ResolveUnixAddr("unixgram", sa)
 		if err != nil {
-			log.Printf("resolving udp address: %v\n", sa)
-			return
+			log.Printf("resolving server URI: %v\n", err)
+			continue
 		}
-
-		si.Conn, err = net.DialUDP("udp", nil, udpAddr)
-		if err != nil {
-			return
-		}
-
 		SERVERS = append(SERVERS, si)
 	}
 
 	engine := nbio.NewEngine(nbio.Config{
 		Network:        "tcp",
-		Addrs:          []string{address},
+		Addrs:          []string{tcpAddress},
 		ReadBufferSize: 512,
 	})
 
@@ -297,7 +313,7 @@ func main() {
 			message.Write(amount)
 			message.WriteByte('\n')
 
-			_, err = s.Conn.Write(message.Bytes())
+			_, err = unixgramConn.WriteTo(message.Bytes(), s.UnixSocketAddress)
 			if err != nil {
 				log.Printf("redirecting POST data: %v\n", err)
 				return
@@ -339,7 +355,7 @@ func main() {
 			message.WriteString(to)
 			message.WriteByte('\n')
 
-			_, err := s.Conn.Write(message.Bytes())
+			_, err := unixgramConn.WriteTo(message.Bytes(), s.UnixSocketAddress)
 			if err != nil {
 				log.Printf("err: %v\n", err)
 				response.Write(HTTP_500_Internal_Server_Error)
@@ -349,7 +365,8 @@ func main() {
 			}
 
 			// reading backend response
-			backendResponse, err := bufio.NewReader(s.Conn).ReadBytes('\n')
+			backendResponseBuf := make([]byte, 512)
+			bytesRead, _, err := unixgramConn.ReadFromUnix(backendResponseBuf)
 			if err != nil {
 				log.Printf("reading from backend server: %v\n", err)
 				response.Write(HTTP_500_Internal_Server_Error)
@@ -358,13 +375,7 @@ func main() {
 				return
 			}
 
-			if err != nil {
-				log.Printf("parsing summary to json: %v\n", err)
-				response.Write(HTTP_500_Internal_Server_Error)
-
-				c.Write(response.Bytes())
-				return
-			}
+			backendResponse := backendResponseBuf[1:bytesRead]
 
 			response.Write(HTTP_200_OK)
 			response.WriteString("Content-Type: application/json\r\n")
@@ -378,7 +389,7 @@ func main() {
 		}
 
 	})
-	err := engine.Start()
+	err = engine.Start()
 	if err != nil {
 		fmt.Printf("nbio.Start failed: %v\n", err)
 		return
@@ -387,5 +398,10 @@ func main() {
 
 	fmt.Println("up and running")
 
-	select {}
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+
+	<-c
+	os.Remove(unixSocketPath)
+	os.Exit(1)
 }
