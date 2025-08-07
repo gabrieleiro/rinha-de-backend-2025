@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os/signal"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"unicode"
@@ -17,6 +18,12 @@ import (
 
 	"github.com/lesismal/nbio"
 )
+
+var bufferPool = sync.Pool{
+	New: func() any {
+		return bytes.NewBuffer(make([]byte, 0, 512))
+	},
+}
 
 var POST = []byte("POST")
 var GET = []byte("GET")
@@ -307,8 +314,10 @@ func main() {
 			// 0x0 = process new payment
 			// 0x1 = get summary
 
-			messageBuf := make([]byte, 0, len(correlationId)+len(amount)+3) // 3 = first byte + ; + \n
-			message := bytes.NewBuffer(messageBuf)
+			message := bufferPool.Get().(*bytes.Buffer)
+			message.Reset()
+			defer bufferPool.Put(message)
+
 			message.WriteByte(uint8(0))
 			message.Write(correlationId)
 			message.WriteByte(';')
@@ -332,8 +341,9 @@ func main() {
 			// allocations and string operations here
 			// and much less raw byte manipulation.
 
-			var responseBuf []byte
-			response := bytes.NewBuffer(responseBuf)
+			response := bufferPool.Get().(*bytes.Buffer)
+			response.Reset()
+			defer bufferPool.Put(response)
 
 			var from, to string
 			if queryArgs != nil {
@@ -349,8 +359,10 @@ func main() {
 			// we want to retrieve a summary of payments
 			// 0x0 = process new payment
 			// 0x1 = get summary
-			messageBuf := make([]byte, 0, len(from)+len(to)+3) // 3 = first byte + ; + \n
-			message := bytes.NewBuffer(messageBuf)
+			message := bufferPool.Get().(*bytes.Buffer)
+			message.Reset()
+			defer bufferPool.Put(message)
+
 			message.WriteByte(uint8(1))
 			message.WriteString(from)
 			message.WriteByte(';')

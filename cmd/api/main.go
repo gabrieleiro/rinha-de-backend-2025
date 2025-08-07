@@ -45,8 +45,20 @@ var PAYMENT_QUEUE_URL = os.Getenv("PAYMENT_QUEUE_URL")
 const HEALTH_CHECKER_INTERVAL = 6 * time.Second
 const MAX_TIMEOUT_IN_MS = 150
 
-var mainQueue chan PaymentRequest
-var retryQueue chan PaymentRequest
+var mainQueue chan *PaymentRequest
+var retryQueue chan *PaymentRequest
+
+var prPool = sync.Pool{
+	New: func() any {
+		return &PaymentRequest{}
+	},
+}
+
+var zeroPr = &PaymentRequest{}
+
+func clearPr(pr *PaymentRequest) {
+	*pr = *zeroPr
+}
 
 var serverConn *net.UnixConn
 var trackerAddr *net.UnixAddr
@@ -114,7 +126,7 @@ func (hc *HealthChecker) check() {
 
 var healthChecker HealthChecker
 
-func tryPay(endpoint string, pr PaymentRequest) error {
+func tryPay(endpoint string, pr *PaymentRequest) error {
 	payload, err := json.Marshal(pr)
 	if err != nil {
 		log.Printf("encoding json: %v\n", err)
@@ -153,7 +165,7 @@ func tryPay(endpoint string, pr PaymentRequest) error {
 	return nil
 }
 
-func tryProcessing(pr PaymentRequest) error {
+func tryProcessing(pr *PaymentRequest) error {
 	defaultTime := healthChecker.Default.MinResponseTime
 	fallbackTime := healthChecker.Default.MinResponseTime
 
@@ -186,7 +198,7 @@ func tryProcessing(pr PaymentRequest) error {
 	}
 }
 
-func trackPayment(pr PaymentRequest, processor string) {
+func trackPayment(pr *PaymentRequest, processor string) {
 	var message strings.Builder
 	message.WriteByte(0)
 	message.WriteString(fmt.Sprintf("%s;%f;%s\n", processor, pr.Amount, pr.RequestedAt))
@@ -203,6 +215,26 @@ func paymentsSummary(payload []byte) {
 		log.Printf("sending message to tracker: %v\n", err)
 		return
 	}
+}
+
+func paymentRequest(payload []byte) {
+	params := strings.Split(string(payload), ";")
+	if len(params) != 2 || params[0] == "" || params[1] == "" {
+		log.Printf("malformed message: %v\n", string(payload))
+		return
+	}
+
+	amount, err := strconv.ParseFloat(params[1], 64)
+	if err != nil {
+		log.Printf("parsing float: %v\n", err)
+		return
+	}
+
+	newPr := prPool.Get().(*PaymentRequest)
+	newPr.Amount = amount
+	newPr.CorrelationID = params[0]
+
+	mainQueue <- newPr
 }
 
 func main() {
@@ -248,17 +280,20 @@ func main() {
 	}
 
 	// init queues
-	mainQueue = make(chan PaymentRequest)
-	retryQueue = make(chan PaymentRequest, 5_000)
+	mainQueue = make(chan *PaymentRequest)
+	retryQueue = make(chan *PaymentRequest, 5_000)
 
 	// consume main queue
 	for range 3 {
 		go func() {
 			for pr := range mainQueue {
 				err := tryProcessing(pr)
+
 				if err != nil {
 					time.Sleep(time.Duration(50) * time.Millisecond)
 					retryQueue <- pr
+				} else {
+					prPool.Put(pr)
 				}
 			}
 		}()
@@ -271,6 +306,8 @@ func main() {
 			if err != nil {
 				time.Sleep(time.Duration(50) * time.Millisecond)
 				retryQueue <- pr
+			} else {
+				prPool.Put(pr)
 			}
 		}
 	}()
@@ -290,21 +327,7 @@ func main() {
 
 			switch MessageType(data[0]) {
 			case ProcessPayment:
-				params := strings.Split(string(data[1:]), ";")
-				if len(params) != 2 || params[0] == "" || params[1] == "" {
-					log.Printf("malformed message: %v\n", string(data[1:]))
-					return
-				}
-
-				amount, err := strconv.ParseFloat(params[1], 64)
-				if err != nil {
-					log.Printf("parsing float: %v\n", err)
-					return
-				}
-
-				go func() {
-					mainQueue <- PaymentRequest{amount, params[0], ""}
-				}()
+				go paymentRequest(data[1:])
 			case RetrieveSummary:
 				go paymentsSummary(data)
 			case Summary:
