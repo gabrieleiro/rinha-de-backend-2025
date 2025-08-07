@@ -12,13 +12,12 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
-
-	"golang.design/x/lockfree"
 )
 
 type MessageType uint8
@@ -46,8 +45,8 @@ var PAYMENT_QUEUE_URL = os.Getenv("PAYMENT_QUEUE_URL")
 const HEALTH_CHECKER_INTERVAL = 6 * time.Second
 const MAX_TIMEOUT_IN_MS = 150
 
-var mainQueue *lockfree.Queue
-var retryQueue *lockfree.Queue
+var mainQueue chan PaymentRequest
+var retryQueue chan PaymentRequest
 
 var serverConn *net.UnixConn
 var trackerAddr *net.UnixAddr
@@ -207,6 +206,7 @@ func paymentsSummary(payload []byte) {
 }
 
 func main() {
+	runtime.GOMAXPROCS(1)
 	serverAddress := os.Getenv("ADDRESS")
 	os.Remove(serverAddress)
 
@@ -248,37 +248,29 @@ func main() {
 	}
 
 	// init queues
-	mainQueue = lockfree.NewQueue()
-	retryQueue = lockfree.NewQueue()
+	mainQueue = make(chan PaymentRequest)
+	retryQueue = make(chan PaymentRequest, 5_000)
 
 	// consume main queue
-	go func() {
-		for {
-			pr := mainQueue.Dequeue()
-			if pr == nil {
-				continue
+	for range 3 {
+		go func() {
+			for pr := range mainQueue {
+				err := tryProcessing(pr)
+				if err != nil {
+					time.Sleep(time.Duration(50) * time.Millisecond)
+					retryQueue <- pr
+				}
 			}
-
-			err := tryProcessing(pr.(PaymentRequest))
-			if err != nil {
-				time.Sleep(time.Duration(50) * time.Millisecond)
-				retryQueue.Enqueue(pr)
-			}
-		}
-	}()
+		}()
+	}
 
 	// consume retry queue
 	go func() {
-		for {
-			pr := retryQueue.Dequeue()
-			if pr == nil {
-				continue
-			}
-
-			err := tryProcessing(pr.(PaymentRequest))
+		for pr := range retryQueue {
+			err := tryProcessing(pr)
 			if err != nil {
 				time.Sleep(time.Duration(50) * time.Millisecond)
-				retryQueue.Enqueue(pr)
+				retryQueue <- pr
 			}
 		}
 	}()
@@ -310,7 +302,9 @@ func main() {
 					return
 				}
 
-				mainQueue.Enqueue(PaymentRequest{amount, params[0], ""})
+				go func() {
+					mainQueue <- PaymentRequest{amount, params[0], ""}
+				}()
 			case RetrieveSummary:
 				go paymentsSummary(data)
 			case Summary:

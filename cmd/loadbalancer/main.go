@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os/signal"
+	"runtime"
 	"sync/atomic"
 	"syscall"
 	"unicode"
@@ -216,6 +217,7 @@ func bodyFrom(request []byte) []byte {
 }
 
 func main() {
+	runtime.GOMAXPROCS(1)
 	serverAddresses := strings.Split(os.Getenv("SERVERS"), ",")
 
 	if len(serverAddresses) < 1 {
