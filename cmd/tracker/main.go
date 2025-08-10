@@ -129,23 +129,29 @@ func main() {
 	}
 	os.Remove(address)
 
-	unixgramAddr, err := net.ResolveUnixAddr("unixgram", address)
+	socketAddr, err := net.ResolveUnixAddr("unix", address)
 	if err != nil {
 		log.Printf("resolving address: %v\n", err)
 		return
 	}
 
-	conn, err := net.ListenUnixgram("unixgram", unixgramAddr)
+	conn, err := net.ListenUnix("unix", socketAddr)
 	if err != nil {
 		log.Printf("listening on socket: %v\n", err)
 		return
 	}
 
 	go func() {
-		for {
-			var buf [512]byte
+		buf := make([]byte, 512)
 
-			n, addr, err := conn.ReadFromUnix(buf[0:])
+		for {
+			clientConn, err := conn.AcceptUnix()
+			if err != nil {
+				log.Printf("accepting unix connection: %v\n", err)
+				continue
+			}
+
+			n, err := clientConn.Read(buf)
 			if err != nil {
 				log.Printf("reading from connection: %v\n", err)
 				continue
@@ -168,6 +174,7 @@ func main() {
 			// And for retrieving the summary:
 			// 0x1<from>;<to>\n
 			if data[0] == 0 {
+				log.Printf("tracking\n")
 				params := strings.Split(string(data[1:]), ";")
 				amount, err := strconv.ParseFloat(params[1], 64)
 				if err != nil {
@@ -209,7 +216,7 @@ func main() {
 				summary := tracker.RangedSummary(from, to)
 				response.WriteByte(2)
 				response.WriteString(summary)
-				conn.WriteTo(response.Bytes(), addr)
+				clientConn.Write(response.Bytes())
 			} else {
 				log.Printf("unrecognized message: %v\n", string(buf[0:]))
 			}

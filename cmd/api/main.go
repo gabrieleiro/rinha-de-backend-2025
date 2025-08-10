@@ -48,12 +48,6 @@ const MAX_TIMEOUT_IN_MS = 150
 var mainQueue chan *PaymentRequest
 var retryQueue chan *PaymentRequest
 
-var prPool = sync.Pool{
-	New: func() any {
-		return &PaymentRequest{}
-	},
-}
-
 var zeroPr = &PaymentRequest{}
 
 func clearPr(pr *PaymentRequest) {
@@ -61,7 +55,7 @@ func clearPr(pr *PaymentRequest) {
 }
 
 var serverConn *net.UnixConn
-var trackerAddr *net.UnixAddr
+var trackerConn *net.UnixConn
 var lbAddr *net.UnixAddr
 
 var client http.Client = http.Client{
@@ -202,7 +196,7 @@ func trackPayment(pr *PaymentRequest, processor string) {
 	var message strings.Builder
 	message.WriteByte(0)
 	message.WriteString(fmt.Sprintf("%s;%f;%s\n", processor, pr.Amount, pr.RequestedAt))
-	_, err := serverConn.WriteTo([]byte(message.String()), trackerAddr)
+	_, err := trackerConn.Write([]byte(message.String()))
 	if err != nil {
 		log.Printf("sending message to tracker: %v\n", err)
 		return
@@ -210,7 +204,7 @@ func trackPayment(pr *PaymentRequest, processor string) {
 }
 
 func paymentsSummary(payload []byte) {
-	_, err := serverConn.WriteTo(append(payload, '\n'), trackerAddr)
+	_, err := trackerConn.Write(append(payload, '\n'))
 	if err != nil {
 		log.Printf("sending message to tracker: %v\n", err)
 		return
@@ -230,11 +224,8 @@ func paymentRequest(payload []byte) {
 		return
 	}
 
-	newPr := prPool.Get().(*PaymentRequest)
-	newPr.Amount = amount
-	newPr.CorrelationID = params[0]
-
-	mainQueue <- newPr
+	newPr := PaymentRequest{amount, params[0], ""}
+	mainQueue <- &newPr
 }
 
 func main() {
@@ -254,10 +245,15 @@ func main() {
 		trackerURI = "./sockets/rinha_tracker.sock"
 	}
 
-	var err error
-	trackerAddr, err = net.ResolveUnixAddr("unixgram", trackerURI)
+	trackerAddr, err := net.ResolveUnixAddr("unix", trackerURI)
 	if err != nil {
 		log.Printf("resolving tracker URI: %v\n", err)
+		return
+	}
+
+	trackerConn, err = net.DialUnix("unix", nil, trackerAddr)
+	if err != nil {
+		log.Printf("dialing tracker URI: %v\n", err)
 		return
 	}
 
@@ -292,8 +288,6 @@ func main() {
 				if err != nil {
 					time.Sleep(time.Duration(50) * time.Millisecond)
 					retryQueue <- pr
-				} else {
-					prPool.Put(pr)
 				}
 			}
 		}()
@@ -306,8 +300,6 @@ func main() {
 			if err != nil {
 				time.Sleep(time.Duration(50) * time.Millisecond)
 				retryQueue <- pr
-			} else {
-				prPool.Put(pr)
 			}
 		}
 	}()
@@ -315,9 +307,9 @@ func main() {
 	// listen to messages from load balancer
 	go func() {
 		for {
-			var buf [512]byte
+			buf := make([]byte, 512)
 
-			n, _, err := serverConn.ReadFromUnix(buf[:])
+			n, _, err := serverConn.ReadFromUnix(buf)
 			if err != nil {
 				log.Printf("reading from connection: %v\n", err)
 				continue
