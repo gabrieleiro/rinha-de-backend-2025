@@ -190,7 +190,10 @@ func tryProcessing(pr *PaymentRequest) error {
 }
 
 func trackPayment(pr *PaymentRequest, processor string) {
-	var message bytes.Buffer
+	message := bytesBufferPool.Get().(*bytes.Buffer)
+	defer bytesBufferPool.Put(message)
+
+	message.Reset()
 	message.WriteByte(0)
 	message.WriteString(fmt.Sprintf("%s;%f;%s\n", processor, pr.Amount, pr.RequestedAt))
 	_, err := trackerConn.Write(message.Bytes())
