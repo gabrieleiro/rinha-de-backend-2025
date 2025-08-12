@@ -39,33 +39,22 @@ var FALLBACK_PROCESSOR_URL = os.Getenv("FALLBACK_PROCESSOR_URL")
 var FALLBACK_PAYMENTS_ENDPOINT = FALLBACK_PROCESSOR_URL + "/payments"
 var FALLBACK_SERVICE_HEALTH_ENDPOINT = FALLBACK_PROCESSOR_URL + "/payments/service-health"
 
-var TRACKER_URL = os.Getenv("TRACKER_URL")
-var PAYMENTS_SUMMARY_ENDPOINT = TRACKER_URL + "/summary"
-var TRACK_PAYMENTS_ENDPOINT = TRACKER_URL + "/track"
-
-var PAYMENT_QUEUE_URL = os.Getenv("PAYMENT_QUEUE_URL")
-
 const HEALTH_CHECKER_INTERVAL = 6 * time.Second
 const MAX_TIMEOUT_IN_MS = 150
 
-var mainQueue chan *PaymentRequest
-var retryQueue chan *PaymentRequest
-
-var zeroPr = &PaymentRequest{}
-
-func clearPr(pr *PaymentRequest) {
-	*pr = *zeroPr
-}
+var paymentsQueue chan *PaymentRequest
 
 var serverConn *net.UnixConn
 var trackerConn *net.UnixConn
 
-var client http.Client = http.Client{
-	Timeout: 150 * time.Millisecond,
+var httpClient http.Client = http.Client{
+	Timeout: MAX_TIMEOUT_IN_MS * time.Millisecond,
 }
 
-var httpClient http.Client = http.Client{
-	Timeout: 200 * time.Millisecond,
+var bytesBufferPool = sync.Pool{
+	New: func() any {
+		return new(bytes.Buffer)
+	},
 }
 
 type PaymentRequest struct {
@@ -129,7 +118,13 @@ func tryPay(endpoint string, pr *PaymentRequest) error {
 		return err
 	}
 
-	response, err := httpClient.Post(endpoint, "application/json", bytes.NewBuffer(payload))
+	buf := bytesBufferPool.Get().(*bytes.Buffer)
+	defer bytesBufferPool.Put(buf)
+
+	buf.Reset()
+	buf.Write(payload)
+
+	response, err := httpClient.Post(endpoint, "application/json", buf)
 	if err != nil {
 		return err
 	}
@@ -248,7 +243,7 @@ func paymentRequest(payload []byte) {
 	}
 
 	newPr := PaymentRequest{amount, params[0], ""}
-	mainQueue <- &newPr
+	paymentsQueue <- &newPr
 }
 
 // zero-allocation json parser
@@ -352,7 +347,7 @@ func payments(ctx *fasthttp.RequestCtx) {
 		RequestedAt:   "",
 	}
 
-	mainQueue <- &newPr
+	paymentsQueue <- &newPr
 }
 
 func requestHandler(ctx *fasthttp.RequestCtx) {
@@ -389,30 +384,22 @@ func main() {
 	}
 
 	// init queues
-	mainQueue = make(chan *PaymentRequest, 10_000)
-	retryQueue = make(chan *PaymentRequest, 5_000)
+	paymentsQueue = make(chan *PaymentRequest, 10_000)
 
 	try := func(pr *PaymentRequest) {
 		err := tryProcessing(pr)
 
-		if err != nil {
-			time.Sleep(50 * time.Millisecond)
-			retryQueue <- pr
+		for err != nil {
+			time.Sleep(20 * time.Millisecond)
+			err = tryProcessing(pr)
 		}
 	}
 
 	// consume queues
 	for range 4 {
 		go func() {
-			for {
-				select {
-				case pr := <-mainQueue:
-					try(pr)
-				case pr := <-retryQueue:
-					try(pr)
-					// default:
-					// 	time.Sleep(100 * time.Microsecond)
-				}
+			for pr := range paymentsQueue {
+				try(pr)
 			}
 		}()
 	}
