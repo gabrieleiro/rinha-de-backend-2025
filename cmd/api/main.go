@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -409,7 +410,7 @@ func main() {
 
 	// listen to messages from load balancer
 	go func() {
-		if err := fasthttp.ListenAndServe(serverAddress, requestHandler); err != nil {
+		if err := fasthttp.ListenAndServeUNIX(serverAddress, fs.ModePerm, requestHandler); err != nil {
 			log.Fatalf("initing http server")
 		}
 	}()
