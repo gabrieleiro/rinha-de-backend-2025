@@ -18,6 +18,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
+
+	"github.com/valyala/fasthttp"
 )
 
 type MessageType uint8
@@ -56,14 +59,13 @@ func clearPr(pr *PaymentRequest) {
 
 var serverConn *net.UnixConn
 var trackerConn *net.UnixConn
-var lbAddr *net.UnixAddr
 
 var client http.Client = http.Client{
 	Timeout: 150 * time.Millisecond,
 }
 
 var httpClient http.Client = http.Client{
-	Timeout: 2000 * time.Millisecond,
+	Timeout: 200 * time.Millisecond,
 }
 
 type PaymentRequest struct {
@@ -149,7 +151,7 @@ func tryPay(endpoint string, pr *PaymentRequest) error {
 		// processsed payments. I don't
 		// have any more time to spend
 		// on this project though :/
-		if response.StatusCode != http.StatusInternalServerError {
+		if response.StatusCode == http.StatusUnprocessableEntity {
 			return nil
 		}
 
@@ -161,7 +163,7 @@ func tryPay(endpoint string, pr *PaymentRequest) error {
 
 func tryProcessing(pr *PaymentRequest) error {
 	defaultTime := healthChecker.Default.MinResponseTime
-	fallbackTime := healthChecker.Default.MinResponseTime
+	fallbackTime := healthChecker.Fallback.MinResponseTime
 
 	defaultGood := !healthChecker.Default.Failing && defaultTime < MAX_TIMEOUT_IN_MS
 	fallbackGood := !healthChecker.Fallback.Failing && fallbackTime < MAX_TIMEOUT_IN_MS
@@ -193,22 +195,43 @@ func tryProcessing(pr *PaymentRequest) error {
 }
 
 func trackPayment(pr *PaymentRequest, processor string) {
-	var message strings.Builder
+	var message bytes.Buffer
 	message.WriteByte(0)
 	message.WriteString(fmt.Sprintf("%s;%f;%s\n", processor, pr.Amount, pr.RequestedAt))
-	_, err := trackerConn.Write([]byte(message.String()))
+	_, err := trackerConn.Write(message.Bytes())
 	if err != nil {
 		log.Printf("sending message to tracker: %v\n", err)
 		return
 	}
 }
 
-func paymentsSummary(payload []byte) {
-	_, err := trackerConn.Write(append(payload, '\n'))
+func paymentsSummary(ctx *fasthttp.RequestCtx) {
+	args := ctx.QueryArgs()
+	from := string(args.Peek("from"))
+	to := string(args.Peek("to"))
+
+	var payload bytes.Buffer
+	payload.WriteByte(uint8(1))
+	payload.WriteString(from)
+	payload.WriteByte(';')
+	payload.WriteString(to)
+	payload.WriteByte('\n')
+
+	_, err := trackerConn.Write(payload.Bytes())
 	if err != nil {
 		log.Printf("sending message to tracker: %v\n", err)
 		return
 	}
+
+	res := make([]byte, 512)
+	n, err := trackerConn.Read(res)
+	if err != nil {
+		log.Printf("reading from tracker: %v\n", err)
+		ctx.Error("", 500)
+		return
+	}
+
+	ctx.Success("application/json", res[:n])
 }
 
 func paymentRequest(payload []byte) {
@@ -228,18 +251,126 @@ func paymentRequest(payload []byte) {
 	mainQueue <- &newPr
 }
 
+// zero-allocation json parser
+// only parses "correlationId" and "amount" fields
+func parseJson(buffer []byte) ([]byte, []byte, error) {
+	var correlationId, amount []byte
+	var c byte
+	var pos int
+
+	advance := func() {
+		pos++
+		c = buffer[pos]
+	}
+
+	for pos = 0; pos < len(buffer); pos++ {
+		c = buffer[pos]
+
+		for c == ' ' || c == '\n' || c == '\t' {
+			advance()
+		}
+
+		if c != '"' {
+			continue
+		}
+
+		advance()
+
+		if c == 'c' { // correlationId
+			for c != ':' {
+				advance()
+			}
+
+			for c != '"' {
+				advance()
+			}
+
+			advance() // skip opening "
+
+			stringStart := pos
+
+			for c != '"' {
+				advance()
+			}
+
+			correlationId = buffer[stringStart:pos]
+		} else if c == 'a' { // amount
+			for c != ':' {
+				advance()
+			}
+
+			for !unicode.IsDigit(rune(c)) {
+				advance()
+			}
+
+			numberStart := pos
+
+			for unicode.IsDigit(rune(c)) {
+				advance()
+			}
+
+			if c == '.' {
+				advance()
+			}
+
+			for unicode.IsDigit(rune(c)) {
+				advance()
+			}
+
+			var err error
+			amount = buffer[numberStart:pos]
+
+			if err != nil {
+				return correlationId, amount, errors.New("parsing float")
+			}
+		}
+	}
+
+	return correlationId, amount, nil
+}
+
+func payments(ctx *fasthttp.RequestCtx) {
+	correlationIdBytes, amountBytes, err := parseJson(ctx.PostBody())
+	if err != nil {
+		log.Printf("parsing json: %v\n", err)
+		return
+	}
+
+	correlationId := string(correlationIdBytes)
+
+	amount, err := strconv.ParseFloat(string(amountBytes), 64)
+	if err != nil {
+		log.Printf("parsing float: %v\n", err)
+		return
+	}
+
+	ctx.Success("text/plain", nil)
+
+	newPr := PaymentRequest{
+		Amount:        amount,
+		CorrelationID: correlationId,
+		RequestedAt:   "",
+	}
+
+	mainQueue <- &newPr
+}
+
+func requestHandler(ctx *fasthttp.RequestCtx) {
+	switch string(ctx.Path()) {
+	case "/payments":
+		payments(ctx)
+	case "/payments-summary":
+		paymentsSummary(ctx)
+	default:
+		ctx.NotFound()
+	}
+}
+
 func main() {
 	runtime.GOMAXPROCS(1)
 	serverAddress := os.Getenv("ADDRESS")
-	os.Remove(serverAddress)
 
 	// networking
-
-	loadBalancerURI := os.Getenv("LOAD_BALANCER_URI")
-	if loadBalancerURI == "" {
-		loadBalancerURI = "./sockets/rinha_load_balancer.sock"
-	}
-
 	var trackerURI = os.Getenv("TRACKER_URI")
 	if trackerURI == "" {
 		trackerURI = "./sockets/rinha_tracker.sock"
@@ -257,76 +388,39 @@ func main() {
 		return
 	}
 
-	lbAddr, err = net.ResolveUnixAddr("unixgram", loadBalancerURI)
-	if err != nil {
-		log.Printf("resolving load balancer URI: %v\n", err)
-		return
-	}
-
-	serverAddr, err := net.ResolveUnixAddr("unixgram", serverAddress)
-	if err != nil {
-		log.Printf("resolving server URI: %v\n", err)
-		return
-	}
-
-	serverConn, err = net.ListenUnixgram("unixgram", serverAddr)
-	if err != nil {
-		log.Printf("listening on socket: %v\n", err)
-		return
-	}
-
 	// init queues
-	mainQueue = make(chan *PaymentRequest)
+	mainQueue = make(chan *PaymentRequest, 10_000)
 	retryQueue = make(chan *PaymentRequest, 5_000)
 
-	// consume main queue
-	for range 3 {
-		go func() {
-			for pr := range mainQueue {
-				err := tryProcessing(pr)
+	try := func(pr *PaymentRequest) {
+		err := tryProcessing(pr)
 
-				if err != nil {
-					time.Sleep(time.Duration(50) * time.Millisecond)
-					retryQueue <- pr
+		if err != nil {
+			time.Sleep(50 * time.Millisecond)
+			retryQueue <- pr
+		}
+	}
+
+	// consume queues
+	for range 4 {
+		go func() {
+			for {
+				select {
+				case pr := <-mainQueue:
+					try(pr)
+				case pr := <-retryQueue:
+					try(pr)
+					// default:
+					// 	time.Sleep(100 * time.Microsecond)
 				}
 			}
 		}()
 	}
 
-	// consume retry queue
-	go func() {
-		for pr := range retryQueue {
-			err := tryProcessing(pr)
-			if err != nil {
-				time.Sleep(time.Duration(50) * time.Millisecond)
-				retryQueue <- pr
-			}
-		}
-	}()
-
 	// listen to messages from load balancer
 	go func() {
-		for {
-			buf := make([]byte, 512)
-
-			n, _, err := serverConn.ReadFromUnix(buf)
-			if err != nil {
-				log.Printf("reading from connection: %v\n", err)
-				continue
-			}
-
-			data := buf[:n-1]
-
-			switch MessageType(data[0]) {
-			case ProcessPayment:
-				go paymentRequest(data[1:])
-			case RetrieveSummary:
-				go paymentsSummary(data)
-			case Summary:
-				go serverConn.WriteTo(data, lbAddr)
-			default:
-				log.Printf("unrecognized message: %v\n", string(data))
-			}
+		if err := fasthttp.ListenAndServe(serverAddress, requestHandler); err != nil {
+			log.Fatalf("initing http server")
 		}
 	}()
 
@@ -336,6 +430,5 @@ func main() {
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 
 	<-c
-	os.Remove(serverAddress)
 	os.Exit(1)
 }

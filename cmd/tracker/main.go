@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"log"
@@ -142,8 +143,6 @@ func main() {
 	}
 
 	go func() {
-		buf := make([]byte, 512)
-
 		for {
 			clientConn, err := conn.AcceptUnix()
 			if err != nil {
@@ -151,75 +150,80 @@ func main() {
 				continue
 			}
 
-			n, err := clientConn.Read(buf)
-			if err != nil {
-				log.Printf("reading from connection: %v\n", err)
-				continue
-			}
+			go func() {
+				buf := make([]byte, 512)
+				reader := bufio.NewReader(clientConn)
+				for {
+					data, err := reader.ReadBytes('\n')
 
-			data := buf[:n-1]
-
-			// The first byte of the payload
-			// indicates whether it's trying
-			// to track a payment that has
-			// been processed or get a summary
-			// of payments tracked so far
-			// 0x0 = track payment
-			// 0x1 = get summary
-
-			// The payload format for tracking
-			// new payments looks like this:
-			// <0x1><default | fallback>;<correlationId>;<amount>\n
-			//
-			// And for retrieving the summary:
-			// 0x1<from>;<to>\n
-			if data[0] == 0 {
-				log.Printf("tracking\n")
-				params := strings.Split(string(data[1:]), ";")
-				amount, err := strconv.ParseFloat(params[1], 64)
-				if err != nil {
-					log.Printf("parsing float: %v\n", err)
-					continue
-				}
-
-				go tracker.Track(TrackRequest{
-					Processor: params[0],
-					Amount:    amount,
-					Time:      params[2],
-				})
-			} else if data[0] == 1 {
-				params := strings.Split(string(data[1:]), ";")
-				var from, to *time.Time
-
-				if params[0] != "" {
-					t, err := time.Parse(time.RFC3339Nano, params[0])
 					if err != nil {
-						log.Printf("parsing from timestamp %v\n", err)
-						continue
+						log.Printf("reading from connection: %v\n", err)
+						break
 					}
 
-					from = &t
-				}
+					data = data[:len(data)-1]
 
-				if len(params) > 1 && params[1] != "" {
-					t, err := time.Parse(time.RFC3339Nano, params[1])
-					if err != nil {
-						log.Printf("parsing to timestamp %v\n", err)
-						return
+					// The first byte of the payload
+					// indicates whether it's trying
+					// to track a payment that has
+					// been processed or get a summary
+					// of payments tracked so far
+					// 0x0 = track payment
+					// 0x1 = get summary
+
+					// The payload format for tracking
+					// new payments looks like this:
+					// <0x1><default | fallback>;<correlationId>;<amount>\n
+					//
+					// And for retrieving the summary:
+					// 0x1<from>;<to>\n
+					if data[0] == 0 {
+						params := strings.Split(string(data[1:]), ";")
+						amount, err := strconv.ParseFloat(params[1], 64)
+						if err != nil {
+							log.Printf("parsing float: %v\n", err)
+							continue
+						}
+
+						go tracker.Track(TrackRequest{
+							Processor: params[0],
+							Amount:    amount,
+							Time:      params[2],
+						})
+					} else if data[0] == 1 {
+						params := strings.Split(string(data[1:]), ";")
+						var from, to *time.Time
+
+						if params[0] != "" {
+							t, err := time.Parse(time.RFC3339Nano, params[0])
+							if err != nil {
+								log.Printf("parsing from timestamp %v\n", err)
+								continue
+							}
+
+							from = &t
+						}
+
+						if len(params) > 1 && params[1] != "" {
+							t, err := time.Parse(time.RFC3339Nano, params[1])
+							if err != nil {
+								log.Printf("parsing to timestamp %v\n", err)
+								return
+							}
+
+							to = &t
+						}
+
+						var response bytes.Buffer
+
+						summary := tracker.RangedSummary(from, to)
+						response.WriteString(summary)
+						clientConn.Write(response.Bytes())
+					} else {
+						log.Printf("unrecognized message: %v\n", string(buf[0:]))
 					}
-
-					to = &t
 				}
-
-				var response bytes.Buffer
-
-				summary := tracker.RangedSummary(from, to)
-				response.WriteByte(2)
-				response.WriteString(summary)
-				clientConn.Write(response.Bytes())
-			} else {
-				log.Printf("unrecognized message: %v\n", string(buf[0:]))
-			}
+			}()
 		}
 	}()
 
