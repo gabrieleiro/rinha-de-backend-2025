@@ -8,7 +8,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -123,7 +122,6 @@ func (t *Tracker) RangedSummary(from, to *time.Time) string {
 }
 
 func main() {
-	runtime.GOMAXPROCS(1)
 	address := os.Getenv("ADDRESS")
 	if address == "" {
 		address = "./sockets/rinha_tracker.sock"

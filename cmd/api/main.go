@@ -13,9 +13,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
-	"runtime"
 	"strconv"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -233,23 +231,6 @@ func paymentsSummary(ctx *fasthttp.RequestCtx) {
 	ctx.Success("application/json", res[:n])
 }
 
-func paymentRequest(payload []byte) {
-	params := strings.Split(string(payload), ";")
-	if len(params) != 2 || params[0] == "" || params[1] == "" {
-		log.Printf("malformed message: %v\n", string(payload))
-		return
-	}
-
-	amount, err := strconv.ParseFloat(params[1], 64)
-	if err != nil {
-		log.Printf("parsing float: %v\n", err)
-		return
-	}
-
-	newPr := PaymentRequest{amount, params[0], ""}
-	paymentsQueue <- &newPr
-}
-
 // zero-allocation json parser
 // only parses "correlationId" and "amount" fields
 func parseJson(buffer []byte) ([]byte, []byte, error) {
@@ -366,7 +347,6 @@ func requestHandler(ctx *fasthttp.RequestCtx) {
 }
 
 func main() {
-	runtime.GOMAXPROCS(1)
 	serverAddress := os.Getenv("ADDRESS")
 
 	// networking
