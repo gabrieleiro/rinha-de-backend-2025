@@ -388,7 +388,12 @@ func paymentsSummary(ctx *fasthttp.RequestCtx, combineWithOtherBackend bool) {
 
 	thisSummary := tracker.RangedSummary(from, to)
 
-	otherSummary := <-summaryChan
+	var otherSummary CombinedPaymentsSummary
+
+	if combineWithOtherBackend {
+		otherSummary = <-summaryChan
+	}
+
 	finalSummary := CombinedPaymentsSummary{}
 	finalSummary.Default.TotalAmount = thisSummary.Default.TotalAmount + otherSummary.Default.TotalAmount
 	finalSummary.Fallback.TotalAmount = thisSummary.Fallback.TotalAmount + otherSummary.Fallback.TotalAmount
