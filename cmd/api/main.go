@@ -360,8 +360,6 @@ func paymentsSummary(ctx *fasthttp.RequestCtx, combineWithOtherBackend bool) {
 
 			summaryChan <- otherSummary
 		}()
-	} else {
-		go func() { summaryChan <- CombinedPaymentsSummary{} }()
 	}
 
 	if fromStr != "" {
