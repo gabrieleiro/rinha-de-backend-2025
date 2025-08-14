@@ -23,12 +23,11 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
-type MessageType uint8
+type ProcessorKind uint8
 
 const (
-	ProcessPayment MessageType = iota
-	RetrieveSummary
-	Summary
+	ProcessorDefault ProcessorKind = iota
+	ProcessorFallback
 )
 
 var DEFAULT_PROCESSOR_URL = os.Getenv("DEFAULT_PROCESSOR_URL")
@@ -49,6 +48,8 @@ var paymentsQueue chan *PaymentRequest
 var trackerQueue chan TrackRequest
 
 var serverConn *net.UnixConn
+
+var AMOUNT float64
 
 var httpClient http.Client = http.Client{
 	Timeout: MAX_TIMEOUT_IN_MS * time.Millisecond,
@@ -72,6 +73,18 @@ type CombinedPaymentsSummary struct {
 	Fallback PaymentsSummary `json:"fallback"`
 }
 
+func (cps *CombinedPaymentsSummary) JSON(buf *bytes.Buffer) {
+	buf.WriteString(`{ "default": { "totalRequests": `)
+	buf.WriteString(strconv.FormatInt(int64(cps.Default.TotalRequests), 10))
+	buf.WriteString(`, "totalAmount": `)
+	buf.WriteString(strconv.FormatFloat(cps.Default.TotalAmount, 'f', 2, 64))
+	buf.WriteString(`}, "fallback": { "totalRequests": `)
+	buf.WriteString(strconv.FormatInt(int64(cps.Fallback.TotalRequests), 10))
+	buf.WriteString(`, "totalAmount": `)
+	buf.WriteString(strconv.FormatFloat(cps.Fallback.TotalAmount, 'f', 2, 64))
+	buf.WriteString(`}}`)
+}
+
 type AmountWithTime struct {
 	Amount float64
 	Time   time.Time
@@ -86,17 +99,14 @@ type StatsTracker struct {
 }
 
 type TrackRequest struct {
-	Processor string  `json:"processor"`
-	Amount    float64 `json:"amount"`
-	Time      string  `json:"time"`
+	Processor ProcessorKind
+	Time      string
 }
 
 type Tracker struct {
-	Default                 PaymentsSummary `json:"default"`
-	Fallback                PaymentsSummary `json:"fallback"`
-	DefaultAmountsWithTime  []AmountWithTime
-	FallbackAmountsWithTime []AmountWithTime
-	mu                      sync.Mutex
+	DefaultTimes  []time.Time
+	FallbackTimes []time.Time
+	mu            sync.Mutex
 }
 
 func (t *Tracker) Track(tr TrackRequest) {
@@ -109,14 +119,10 @@ func (t *Tracker) Track(tr TrackRequest) {
 		return
 	}
 
-	if tr.Processor == "default" {
-		t.Default.TotalRequests++
-		t.Default.TotalAmount += tr.Amount
-		t.DefaultAmountsWithTime = append(t.DefaultAmountsWithTime, AmountWithTime{tr.Amount, timestamp})
+	if tr.Processor == ProcessorDefault {
+		t.DefaultTimes = append(t.DefaultTimes, timestamp)
 	} else {
-		t.Fallback.TotalRequests++
-		t.Fallback.TotalAmount += tr.Amount
-		t.FallbackAmountsWithTime = append(t.FallbackAmountsWithTime, AmountWithTime{tr.Amount, timestamp})
+		t.FallbackTimes = append(t.FallbackTimes, timestamp)
 	}
 }
 
@@ -126,39 +132,36 @@ func (t *Tracker) RangedSummary(from, to *time.Time) CombinedPaymentsSummary {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	var defaultAmount, fallbackAmount float64
 	var defaultRequests, fallbackRequests int
 
-	for _, p := range t.DefaultAmountsWithTime {
+	for _, p := range t.DefaultTimes {
 		inRange := true
 
-		if from != nil && p.Time.Before(*from) {
+		if from != nil && p.Before(*from) {
 			inRange = false
 		}
 
-		if to != nil && p.Time.After(*to) {
+		if to != nil && p.After(*to) {
 			inRange = false
 		}
 
 		if inRange {
-			defaultAmount += p.Amount
 			defaultRequests++
 		}
 	}
 
-	for _, p := range t.FallbackAmountsWithTime {
+	for _, p := range t.FallbackTimes {
 		inRange := true
 
-		if from != nil && p.Time.Before(*from) {
+		if from != nil && p.Before(*from) {
 			inRange = false
 		}
 
-		if to != nil && p.Time.After(*to) {
+		if to != nil && p.After(*to) {
 			inRange = false
 		}
 
 		if inRange {
-			fallbackAmount += p.Amount
 			fallbackRequests++
 		}
 	}
@@ -166,19 +169,28 @@ func (t *Tracker) RangedSummary(from, to *time.Time) CombinedPaymentsSummary {
 	return CombinedPaymentsSummary{
 		Default: PaymentsSummary{
 			TotalRequests: defaultRequests,
-			TotalAmount:   defaultAmount,
+			TotalAmount:   AMOUNT * float64(defaultRequests),
 		},
 		Fallback: PaymentsSummary{
 			TotalRequests: fallbackRequests,
-			TotalAmount:   fallbackAmount,
+			TotalAmount:   AMOUNT * float64(fallbackRequests),
 		},
 	}
 }
 
 type PaymentRequest struct {
-	Amount        float64 `json:"amount"`
-	CorrelationID string  `json:"correlationId"`
-	RequestedAt   string  `json:"requestedAt"`
+	CorrelationID string `json:"correlationId"`
+	RequestedAt   string `json:"requestedAt"`
+}
+
+func (pr *PaymentRequest) JSON(buf *bytes.Buffer) {
+	buf.WriteString(`{"correlationId": "`)
+	buf.WriteString(pr.CorrelationID)
+	buf.WriteString(`", "amount": `)
+	buf.WriteString(strconv.FormatFloat(AMOUNT, 'f', 2, 64))
+	buf.WriteString(`, "requestedAt": "`)
+	buf.WriteString(pr.RequestedAt)
+	buf.WriteString(`" }`)
 }
 
 type ServiceHealth struct {
@@ -230,17 +242,11 @@ func (hc *HealthChecker) check() {
 var healthChecker HealthChecker
 
 func tryPay(endpoint string, pr *PaymentRequest) error {
-	payload, err := json.Marshal(pr)
-	if err != nil {
-		log.Printf("encoding json: %v\n", err)
-		return err
-	}
-
 	buf := bytesBufferPool.Get().(*bytes.Buffer)
 	defer bytesBufferPool.Put(buf)
 
 	buf.Reset()
-	buf.Write(payload)
+	pr.JSON(buf)
 
 	response, err := httpClient.Post(endpoint, "application/json", buf)
 	if err != nil {
@@ -287,7 +293,7 @@ func tryProcessing(pr *PaymentRequest) error {
 		err := tryPay(DEFAULT_PAYMENTS_ENDPOINT, pr)
 
 		if err == nil {
-			trackPayment(pr, "default")
+			trackPayment(pr, ProcessorDefault)
 		}
 
 		return err
@@ -297,7 +303,7 @@ func tryProcessing(pr *PaymentRequest) error {
 		err := tryPay(FALLBACK_PAYMENTS_ENDPOINT, pr)
 
 		if err == nil {
-			trackPayment(pr, "fallback")
+			trackPayment(pr, ProcessorFallback)
 		}
 
 		return err
@@ -307,15 +313,14 @@ func tryProcessing(pr *PaymentRequest) error {
 	}
 }
 
-func trackPayment(pr *PaymentRequest, processor string) {
+func trackPayment(pr *PaymentRequest, processor ProcessorKind) {
 	trackerQueue <- TrackRequest{
 		Processor: processor,
-		Amount:    pr.Amount,
 		Time:      pr.RequestedAt,
 	}
 }
 
-func paymentsSummary(ctx *fasthttp.RequestCtx) {
+func paymentsSummary(ctx *fasthttp.RequestCtx, combineWithOtherBackend bool) {
 	args := ctx.QueryArgs()
 
 	argsCopy := fasthttp.Args{}
@@ -325,36 +330,39 @@ func paymentsSummary(ctx *fasthttp.RequestCtx) {
 	toStr := string(argsCopy.Peek("to"))
 
 	var from, to *time.Time
-	var err error
 
 	summaryChan := make(chan CombinedPaymentsSummary)
 
-	go func() {
-		otherSummary := CombinedPaymentsSummary{}
+	if combineWithOtherBackend {
+		go func() {
+			otherSummary := CombinedPaymentsSummary{}
 
-		fullEndpoint := fmt.Sprintf("%s?from=%s&to=%s", OTHER_BACKEND_ENDPOINT, fromStr, toStr)
-		response, err := unixClient.Get(fullEndpoint)
-		if err != nil {
-			log.Printf("getting summary from other endpoint: %v\n", err)
+			fullEndpoint := fmt.Sprintf("%s?from=%s&to=%s", OTHER_BACKEND_ENDPOINT, fromStr, toStr)
+			response, err := unixClient.Get(fullEndpoint)
+			if err != nil {
+				log.Printf("getting summary from other endpoint: %v\n", err)
+				summaryChan <- otherSummary
+				return
+			}
+
+			if response.StatusCode != http.StatusOK {
+				log.Printf("getting summary from other endpoint: %v\n", response.Status)
+				summaryChan <- otherSummary
+				return
+			}
+
+			defer response.Body.Close()
+
+			err = json.NewDecoder(response.Body).Decode(&otherSummary)
+			if err != nil {
+				log.Printf("unmarshalling json: %v\n", err)
+			}
+
 			summaryChan <- otherSummary
-			return
-		}
-
-		if response.StatusCode != http.StatusOK {
-			log.Printf("getting summary from other endpoint: %v\n", response.Status)
-			summaryChan <- otherSummary
-			return
-		}
-
-		defer response.Body.Close()
-
-		err = json.NewDecoder(response.Body).Decode(&otherSummary)
-		if err != nil {
-			log.Printf("unmarshalling json: %v\n", err)
-		}
-
-		summaryChan <- otherSummary
-	}()
+		}()
+	} else {
+		go func() { summaryChan <- CombinedPaymentsSummary{} }()
+	}
 
 	if fromStr != "" {
 		parsedFrom, err := time.Parse(time.RFC3339Nano, fromStr)
@@ -388,61 +396,19 @@ func paymentsSummary(ctx *fasthttp.RequestCtx) {
 	finalSummary.Default.TotalRequests = thisSummary.Default.TotalRequests + otherSummary.Default.TotalRequests
 	finalSummary.Fallback.TotalRequests = thisSummary.Fallback.TotalRequests + otherSummary.Fallback.TotalRequests
 
-	jsonResponse, err := json.Marshal(finalSummary)
-	if err != nil {
-		log.Printf("marshalling json: %v\n", err)
-		ctx.Error("", 500)
-		return
-	}
+	buf := bytesBufferPool.Get().(*bytes.Buffer)
+	defer bytesBufferPool.Put(buf)
 
-	ctx.Success("application/json", jsonResponse)
-}
+	buf.Reset()
+	finalSummary.JSON(buf)
 
-func paymentsSummaryInternal(ctx *fasthttp.RequestCtx) {
-	args := ctx.QueryArgs()
-	fromStr := string(args.Peek("from"))
-	toStr := string(args.Peek("to"))
-
-	var from, to *time.Time
-	var err error
-
-	if fromStr != "" {
-		parsedFrom, err := time.Parse(time.RFC3339Nano, fromStr)
-		if err != nil {
-			log.Printf("parsing from timestamp %v\n", err)
-			ctx.Error("", 400)
-			return
-		}
-
-		from = &parsedFrom
-	}
-
-	if toStr != "" {
-		parsedTo, err := time.Parse(time.RFC3339Nano, toStr)
-		if err != nil {
-			log.Printf("parsing from timestamp %v\n", err)
-			ctx.Error("", 400)
-			return
-		}
-
-		to = &parsedTo
-	}
-
-	thisSummary := tracker.RangedSummary(from, to)
-
-	jsonResponse, err := json.Marshal(thisSummary)
-	if err != nil {
-		log.Printf("marshalling json: %v\n", err)
-		ctx.Error("", 500)
-		return
-	}
-
-	ctx.Success("application/json", jsonResponse)
+	ctx.Success("application/json", buf.Bytes())
 }
 
 // zero-allocation json parser
 // only parses "correlationId" and "amount" fields
-func parseJson(buffer []byte) ([]byte, []byte, error) {
+// only returns correlationId value
+func parseJson(buffer []byte) ([]byte, error) {
 	var correlationId, amount []byte
 	var c byte
 	var pos int
@@ -484,6 +450,14 @@ func parseJson(buffer []byte) ([]byte, []byte, error) {
 
 			correlationId = buffer[stringStart:pos]
 		} else if c == 'a' { // amount
+			if AMOUNT != 0 {
+				for pos < len(buffer) && (c != ',' && c != '}') {
+					advance()
+				}
+
+				continue
+			}
+
 			for c != ':' {
 				advance()
 			}
@@ -508,18 +482,19 @@ func parseJson(buffer []byte) ([]byte, []byte, error) {
 
 			var err error
 			amount = buffer[numberStart:pos]
+			AMOUNT, _ = strconv.ParseFloat(string(amount), 64)
 
 			if err != nil {
-				return correlationId, amount, errors.New("parsing float")
+				return correlationId, errors.New("parsing float")
 			}
 		}
 	}
 
-	return correlationId, amount, nil
+	return correlationId, nil
 }
 
 func payments(ctx *fasthttp.RequestCtx) {
-	correlationIdBytes, amountBytes, err := parseJson(ctx.PostBody())
+	correlationIdBytes, err := parseJson(ctx.PostBody())
 	if err != nil {
 		log.Printf("parsing json: %v\n", err)
 		return
@@ -527,16 +502,9 @@ func payments(ctx *fasthttp.RequestCtx) {
 
 	correlationId := string(correlationIdBytes)
 
-	amount, err := strconv.ParseFloat(string(amountBytes), 64)
-	if err != nil {
-		log.Printf("parsing float: %v\n", err)
-		return
-	}
-
 	ctx.Success("text/plain", nil)
 
 	newPr := PaymentRequest{
-		Amount:        amount,
 		CorrelationID: correlationId,
 		RequestedAt:   "",
 	}
@@ -549,9 +517,9 @@ func requestHandler(ctx *fasthttp.RequestCtx) {
 	case "/payments":
 		payments(ctx)
 	case "/payments-summary":
-		paymentsSummary(ctx)
+		paymentsSummary(ctx, true)
 	case "/payments-summary-internal":
-		paymentsSummaryInternal(ctx)
+		paymentsSummary(ctx, false)
 	default:
 		ctx.NotFound()
 	}
