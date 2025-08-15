@@ -49,8 +49,6 @@ var trackerQueue chan TrackRequest
 
 var serverConn *net.UnixConn
 
-var AMOUNT float64
-
 var httpClient http.Client = http.Client{
 	Timeout: MAX_TIMEOUT_IN_MS * time.Millisecond,
 }
@@ -100,13 +98,14 @@ type StatsTracker struct {
 
 type TrackRequest struct {
 	Processor ProcessorKind
+	Amount    float64
 	Time      string
 }
 
 type Tracker struct {
-	DefaultTimes  []time.Time
-	FallbackTimes []time.Time
-	mu            sync.Mutex
+	DefaultAmountsWithTime  []AmountWithTime
+	FallbackAmountsWithTime []AmountWithTime
+	mu                      sync.Mutex
 }
 
 func (t *Tracker) Track(tr TrackRequest) {
@@ -120,9 +119,9 @@ func (t *Tracker) Track(tr TrackRequest) {
 	}
 
 	if tr.Processor == ProcessorDefault {
-		t.DefaultTimes = append(t.DefaultTimes, timestamp)
+		t.DefaultAmountsWithTime = append(t.DefaultAmountsWithTime, AmountWithTime{tr.Amount, timestamp})
 	} else {
-		t.FallbackTimes = append(t.FallbackTimes, timestamp)
+		t.FallbackAmountsWithTime = append(t.FallbackAmountsWithTime, AmountWithTime{tr.Amount, timestamp})
 	}
 }
 
@@ -132,36 +131,39 @@ func (t *Tracker) RangedSummary(from, to *time.Time) CombinedPaymentsSummary {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	var defaultAmount, fallbackAmount float64
 	var defaultRequests, fallbackRequests int
 
-	for _, p := range t.DefaultTimes {
+	for _, p := range t.DefaultAmountsWithTime {
 		inRange := true
 
-		if from != nil && p.Before(*from) {
+		if from != nil && p.Time.Before(*from) {
 			inRange = false
 		}
 
-		if to != nil && p.After(*to) {
+		if to != nil && p.Time.After(*to) {
 			inRange = false
 		}
 
 		if inRange {
+			defaultAmount += p.Amount
 			defaultRequests++
 		}
 	}
 
-	for _, p := range t.FallbackTimes {
+	for _, p := range t.FallbackAmountsWithTime {
 		inRange := true
 
-		if from != nil && p.Before(*from) {
+		if from != nil && p.Time.Before(*from) {
 			inRange = false
 		}
 
-		if to != nil && p.After(*to) {
+		if to != nil && p.Time.After(*to) {
 			inRange = false
 		}
 
 		if inRange {
+			fallbackAmount += p.Amount
 			fallbackRequests++
 		}
 	}
@@ -169,25 +171,26 @@ func (t *Tracker) RangedSummary(from, to *time.Time) CombinedPaymentsSummary {
 	return CombinedPaymentsSummary{
 		Default: PaymentsSummary{
 			TotalRequests: defaultRequests,
-			TotalAmount:   AMOUNT * float64(defaultRequests),
+			TotalAmount:   defaultAmount,
 		},
 		Fallback: PaymentsSummary{
 			TotalRequests: fallbackRequests,
-			TotalAmount:   AMOUNT * float64(fallbackRequests),
+			TotalAmount:   fallbackAmount,
 		},
 	}
 }
 
 type PaymentRequest struct {
-	CorrelationID string `json:"correlationId"`
-	RequestedAt   string `json:"requestedAt"`
+	Amount        float64 `json:"amount"`
+	CorrelationID string  `json:"correlationId"`
+	RequestedAt   string  `json:"requestedAt"`
 }
 
 func (pr *PaymentRequest) JSON(buf *bytes.Buffer) {
 	buf.WriteString(`{"correlationId": "`)
 	buf.WriteString(pr.CorrelationID)
 	buf.WriteString(`", "amount": `)
-	buf.WriteString(strconv.FormatFloat(AMOUNT, 'f', 2, 64))
+	buf.WriteString(strconv.FormatFloat(pr.Amount, 'f', 2, 64))
 	buf.WriteString(`, "requestedAt": "`)
 	buf.WriteString(pr.RequestedAt)
 	buf.WriteString(`" }`)
@@ -317,6 +320,7 @@ func trackPayment(pr *PaymentRequest, processor ProcessorKind) {
 	trackerQueue <- TrackRequest{
 		Processor: processor,
 		Time:      pr.RequestedAt,
+		Amount:    pr.Amount,
 	}
 }
 
@@ -411,7 +415,7 @@ func paymentsSummary(ctx *fasthttp.RequestCtx, combineWithOtherBackend bool) {
 // zero-allocation json parser
 // only parses "correlationId" and "amount" fields
 // only returns correlationId value
-func parseJson(buffer []byte) ([]byte, error) {
+func parseJson(buffer []byte) ([]byte, []byte, error) {
 	var correlationId, amount []byte
 	var c byte
 	var pos int
@@ -453,14 +457,6 @@ func parseJson(buffer []byte) ([]byte, error) {
 
 			correlationId = buffer[stringStart:pos]
 		} else if c == 'a' { // amount
-			if AMOUNT != 0 {
-				for pos < len(buffer) && (c != ',' && c != '}') {
-					advance()
-				}
-
-				continue
-			}
-
 			for c != ':' {
 				advance()
 			}
@@ -485,19 +481,18 @@ func parseJson(buffer []byte) ([]byte, error) {
 
 			var err error
 			amount = buffer[numberStart:pos]
-			AMOUNT, _ = strconv.ParseFloat(string(amount), 64)
 
 			if err != nil {
-				return correlationId, errors.New("parsing float")
+				return correlationId, amount, errors.New("parsing float")
 			}
 		}
 	}
 
-	return correlationId, nil
+	return correlationId, amount, nil
 }
 
 func payments(ctx *fasthttp.RequestCtx) {
-	correlationIdBytes, err := parseJson(ctx.PostBody())
+	correlationIdBytes, amountBytes, err := parseJson(ctx.PostBody())
 	if err != nil {
 		log.Printf("parsing json: %v\n", err)
 		return
@@ -505,9 +500,16 @@ func payments(ctx *fasthttp.RequestCtx) {
 
 	correlationId := string(correlationIdBytes)
 
+	amount, err := strconv.ParseFloat(string(amountBytes), 64)
+	if err != nil {
+		log.Printf("parsing float: %v\n", err)
+		return
+	}
+
 	ctx.Success("text/plain", nil)
 
 	newPr := PaymentRequest{
+		Amount:        amount,
 		CorrelationID: correlationId,
 		RequestedAt:   "",
 	}
